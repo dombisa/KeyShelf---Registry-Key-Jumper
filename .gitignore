@@ -1,0 +1,8 @@
+*.exe
+*.o
+# локальные данные программы / local program data
+keyshelf.ini
+keyshelf.log
+keyshelf.ksl
+Saved/
+Bat/
