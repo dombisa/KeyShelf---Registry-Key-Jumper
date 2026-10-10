@@ -34,7 +34,10 @@
 
 ## Сборка
 
-Из Linux (Debian/Ubuntu):
+Релизные exe собираются автоматически в GitHub Actions (`.github/workflows/build.yml`): каждый push
+собирает проект, а тег вида `v0.2` создаёт релиз с exe-файлами и контрольными суммами.
+
+Локально из Linux (Debian/Ubuntu):
 
 ```sh
 sudo apt install gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 binutils-mingw-w64
