@@ -23,8 +23,8 @@
 #include <stdarg.h>
 #include <wchar.h>
 
-#define APP_NAME   L"KeyShelf"
-#define APP_VER    L"0.1"
+#define APP_NAME   L"Key Shelf Reg Jumper"
+#define APP_VER    L"0.3"
 #define CLS_MAIN   L"KeyShelfMainWnd"
 #define CLS_DLG    L"KeyShelfRegDlg"
 #define MUTEX_NAME L"KeyShelf_SingleInstance_Mutex"
@@ -49,6 +49,12 @@ enum {
 #define WM_APP_SAVEDREFRESH (WM_APP + 5)
 #define CLS_EXP  L"KeyShelfExpDlg"
 #define CLS_BUSY L"KeyShelfBusy"
+enum {
+  IDC_SNAPLV = 120, IDC_DIFFLV, IDC_SNAPINFO,
+  IDM_SNAPNEW = 260, IDM_SNAPCMP, IDM_SNAPDEL, IDM_SNAPEXCL, IDM_SNAPDIR, IDM_REPDIR, IDM_REPOPEN, IDM_LOGTOGGLE,
+  IDS_NAME = 500, IDS_BOOK, IDS_HKLM, IDS_HKCU, IDS_HKU, IDS_MANUAL, IDS_EXCL, IDS_EDITEXCL
+};
+#define CLS_SNAP L"KeyShelfSnapDlg"
 #define WM_APP_QUEUE    (WM_APP + 2)
 #define WM_APP_JUMPFAIL (WM_APP + 3)
 #define TIMER_SAVE 1
@@ -74,6 +80,9 @@ static HWND g_hTab, g_hSaved, g_hCount, g_hBtnX[3];
 static int g_tab, g_imgReg;
 static wchar_t g_savedDir[MAX_PATH], g_batDir[MAX_PATH], g_pendingSelect[MAX_PATH + 8];
 static HTREEITEM g_curS, g_dragS;
+static HWND g_hSnapLV, g_hDiffLV, g_hSnapInfo;
+static BOOL g_logOn = TRUE;
+static void SnapRefreshUI(void);
 static BOOL g_dragSaved;
 
 /* ---- лог ---- */
@@ -85,7 +94,7 @@ static void Log(const wchar_t *fmt, ...)
   SYSTEMTIME st;
   HANDLE h;
   DWORD w;
-  if (!g_logFile[0]) return;
+  if (!g_logFile[0] || !g_logOn) return;
   va_start(ap, fmt);
   _vsnwprintf(buf, 2047, fmt, ap);
   va_end(ap);
@@ -800,7 +809,7 @@ static BOOL SetShellMenu(BOOL on)
   }
   if (RegCreateKeyExW(HKEY_CURRENT_USER, SHELL_KEY, 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) != ERROR_SUCCESS) return FALSE;
   {
-    const wchar_t *label = L"Добавить в KeyShelf";
+    const wchar_t *label = L"Добавить в Key Shelf Reg Jumper";
     RegSetValueExW(k, NULL, 0, REG_SZ, (const BYTE *)label, (DWORD)((wcslen(label) + 1) * sizeof(wchar_t)));
     _snwprintf(icon, MAX_PATH + 7, L"%ls,0", g_exe);
     icon[MAX_PATH + 7] = 0;
@@ -1748,7 +1757,7 @@ static LRESULT CALLBACK ExpProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         }
         Mk(h, L"STATIC", L"Имя файла (пример):", 0, 8, y, W, 16, 92, 0); y += 18;
         d->ePrev = Mk(h, L"EDIT", L"", ES_AUTOHSCROLL | ES_READONLY, 8, y, W, 22, IDE_PREVIEW, WS_EX_CLIENTEDGE); y += 32;
-        d->rArch = Mk(h, L"BUTTON", L"Сохранить в архив KeyShelf (вкладка «Сохранённые»)", WS_GROUP | WS_TABSTOP | BS_AUTORADIOBUTTON, 8, y, W, 20, IDE_ARCH, 0); y += 22;
+        d->rArch = Mk(h, L"BUTTON", L"Сохранить в архив программы (вкладка «Сохранённые»)", WS_GROUP | WS_TABSTOP | BS_AUTORADIOBUTTON, 8, y, W, 20, IDE_ARCH, 0); y += 22;
         SendMessageW(d->rArch, BM_SETCHECK, BST_CHECKED, 0);
         d->lA1 = Mk(h, L"STATIC", L"Папка в архиве:", 0, 28, y, W - 20, 16, 93, 0); y += 18;
         d->combo = Mk(h, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 28, y, W - 20, 200, IDE_COMBO, 0); y += 28;
@@ -1952,6 +1961,7 @@ static int SavedCountFiles(HTREEITEM parent)
 static void UpdateCount(void)
 {
   wchar_t b[200];
+  if (g_tab == 2) { SnapRefreshUI(); return; }
   if (g_tab == 0) _snwprintf(b, 199, L"Отмечено веток: %d  (групповые действия)", CountChecked(TVI_ROOT));
   else _snwprintf(b, 199, L"Файлов в архиве: %d", SavedCountFiles(TVI_ROOT));
   b[199] = 0;
@@ -2046,11 +2056,33 @@ static void ShowSaved(HTREEITEM it)
 
 static void SwitchTab(int t)
 {
+  int k, v0 = (t != 2);
   if (g_tab == 0 && t != 0) CommitEdits();
   g_tab = t;
   TabCtrl_SetCurSel(g_hTab, t);
   ShowWindow(g_hTree, t == 0 ? SW_SHOW : SW_HIDE);
   ShowWindow(g_hSaved, t == 1 ? SW_SHOW : SW_HIDE);
+  ShowWindow(g_hSnapLV, t == 2 ? SW_SHOW : SW_HIDE);
+  ShowWindow(g_hDiffLV, t == 2 ? SW_SHOW : SW_HIDE);
+  ShowWindow(g_hSnapInfo, t == 2 ? SW_SHOW : SW_HIDE);
+  for (k = 0; k < 3; k++) ShowWindow(g_hLbl[k], v0 ? SW_SHOW : SW_HIDE);
+  ShowWindow(g_hName, v0 ? SW_SHOW : SW_HIDE);
+  ShowWindow(g_hPath, v0 ? SW_SHOW : SW_HIDE);
+  ShowWindow(g_hComment, v0 ? SW_SHOW : SW_HIDE);
+  ShowWindow(g_hChkNew, v0 ? SW_SHOW : SW_HIDE);
+  if (t == 2) {
+    SetWindowTextW(g_hBtnJump, L"Сделать снимок…");
+    SetWindowTextW(g_hBtnJumpNew, L"Сравнить");
+    SetWindowTextW(g_hBtnX[0], L"Открыть отчёт");
+    SetWindowTextW(g_hBtnX[1], L"Папка снимков");
+    SetWindowTextW(g_hBtnX[2], L"Удалить снимок");
+    EnableWindow(g_hBtnJump, TRUE);
+    EnableWindow(g_hBtnX[1], TRUE);
+    SnapRefreshUI();
+    return;
+  }
+  SetWindowTextW(g_hBtnJump, L"Перейти");
+  SetWindowTextW(g_hBtnJumpNew, L"Перейти в новом окне");
   SetWindowTextW(g_hLbl[0], t == 0 ? L"Название:" : L"Файл:");
   SetWindowTextW(g_hLbl[1], t == 0 ? L"Путь в реестре:" : L"Ветка (первая в файле):");
   SetWindowTextW(g_hLbl[2], t == 0 ? L"Комментарий:" : L"Сведения:");
@@ -2416,6 +2448,1309 @@ static void ActExpBat(void)
   free(tl.t);
 }
 
+/* ====================================================================
+ *  v0.3: снимки реестра, сравнение «было / стало», отчёты
+ * ==================================================================== */
+static wchar_t g_snapDir[MAX_PATH], g_repDir[MAX_PATH], g_exclFile[MAX_PATH], g_lastReport[MAX_PATH + 16], g_cmpSummary[900];
+
+typedef struct { wchar_t **roots; int nroots, caproots; wchar_t **excl; int nexcl, capexcl; } Scope;
+
+static void AddStr(wchar_t ***arr, int *n, int *cap, const wchar_t *s)
+{
+  if (*n == *cap) {
+    *cap = *cap ? *cap * 2 : 16;
+    *arr = (wchar_t **)realloc(*arr, *cap * sizeof(wchar_t *));
+  }
+  (*arr)[(*n)++] = Dup(s);
+}
+static void ScAddRoot(Scope *s, const wchar_t *p) { AddStr(&s->roots, &s->nroots, &s->caproots, p); }
+static void ScAddExcl(Scope *s, const wchar_t *p) { AddStr(&s->excl, &s->nexcl, &s->capexcl, p); }
+static void ScFree(Scope *s)
+{
+  int i;
+  for (i = 0; i < s->nroots; i++) free(s->roots[i]);
+  for (i = 0; i < s->nexcl; i++) free(s->excl[i]);
+  free(s->roots); free(s->excl);
+  memset(s, 0, sizeof *s);
+}
+
+static BOOL IsUnderPath(const wchar_t *path, const wchar_t *base)
+{
+  size_t l = wcslen(base);
+  return _wcsnicmp(path, base, l) == 0 && (path[l] == 0 || path[l] == L'\\');
+}
+
+static BOOL InScope(const Scope *s, const wchar_t *path)
+{
+  int i;
+  BOOL in = FALSE;
+  for (i = 0; i < s->nroots; i++) if (IsUnderPath(path, s->roots[i])) { in = TRUE; break; }
+  if (!in) return FALSE;
+  for (i = 0; i < s->nexcl; i++) if (IsUnderPath(path, s->excl[i])) return FALSE;
+  return TRUE;
+}
+
+/* ---- сравнение имён и путей: единый порядок обхода реестра ---- */
+static int CmpName(const wchar_t *a, size_t la, const wchar_t *b, size_t lb)
+{
+  int r = CompareStringOrdinal(a, (int)la, b, (int)lb, TRUE);
+  return r == CSTR_LESS_THAN ? -1 : r == CSTR_GREATER_THAN ? 1 : 0;
+}
+
+static int CmpKeyPath(const wchar_t *a, const wchar_t *b)
+{
+  for (;;) {
+    const wchar_t *ea = wcschr(a, L'\\'), *eb = wcschr(b, L'\\');
+    size_t la = ea ? (size_t)(ea - a) : wcslen(a), lb = eb ? (size_t)(eb - b) : wcslen(b);
+    int c = CmpName(a, la, b, lb);
+    if (c) return c;
+    if (!ea && !eb) return 0;
+    if (!ea) return -1;
+    if (!eb) return 1;
+    a = ea + 1; b = eb + 1;
+  }
+}
+
+static int QsCmpStr(const void *x, const void *y)
+{
+  const wchar_t *a = *(wchar_t *const *)x, *b = *(wchar_t *const *)y;
+  return CmpName(a, wcslen(a), b, wcslen(b));
+}
+static int QsCmpPath(const void *x, const void *y) { return CmpKeyPath(*(wchar_t *const *)x, *(wchar_t *const *)y); }
+
+typedef struct { wchar_t *name; DWORD type, size; BYTE *data; } ValEnt;
+static int QsCmpVal(const void *x, const void *y)
+{
+  const ValEnt *a = (const ValEnt *)x, *b = (const ValEnt *)y;
+  return CmpName(a->name, wcslen(a->name), b->name, wcslen(b->name));
+}
+
+/* ---- экранирование для текстовых строк снимка ---- */
+static void wb_esc2(WBuf *b, const wchar_t *s, size_t len)
+{
+  size_t i;
+  for (i = 0; i < len; i++) {
+    switch (s[i]) {
+      case L'\\': wb_adds(b, L"\\\\"); break;
+      case L'\t': wb_adds(b, L"\\t"); break;
+      case L'\n': wb_adds(b, L"\\n"); break;
+      case L'\r': wb_adds(b, L"\\r"); break;
+      default: wb_addc(b, s[i]);
+    }
+  }
+}
+
+static wchar_t *Unesc2(const wchar_t *s, size_t len)
+{
+  wchar_t *o = (wchar_t *)malloc((len + 1) * sizeof(wchar_t));
+  size_t i, n = 0;
+  for (i = 0; i < len; i++) {
+    if (s[i] == L'\\' && i + 1 < len) {
+      i++;
+      o[n++] = s[i] == L't' ? L'\t' : s[i] == L'n' ? L'\n' : s[i] == L'r' ? L'\r' : s[i];
+    } else o[n++] = s[i];
+  }
+  o[n] = 0;
+  return o;
+}
+
+static unsigned long long Hash64(const BYTE *p, DWORD n)
+{
+  unsigned long long h = 1469598103934665603ULL;
+  DWORD i;
+  for (i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+  return h;
+}
+
+/* текстовое представление данных значения (до 512 байт целиком, дальше - хэш) */
+static wchar_t *ValRepr(DWORD type, const BYTE *d, DWORD size)
+{
+  WBuf b = { 0 };
+  wchar_t tmp[64];
+  DWORD i;
+  if (size > 512) {
+    _snwprintf(tmp, 63, L"#%016llX", Hash64(d, size));
+    wb_adds(&b, tmp);
+    return b.p;
+  }
+  switch (type) {
+    case REG_SZ: case REG_EXPAND_SZ: {
+      size_t n = size / 2;
+      while (n > 0 && ((const wchar_t *)d)[n - 1] == 0) n--;
+      wb_esc2(&b, (const wchar_t *)d, n);
+      break;
+    }
+    case REG_DWORD:
+      if (size >= 4) { DWORD v; memcpy(&v, d, 4); _snwprintf(tmp, 63, L"0x%08lX", v); wb_adds(&b, tmp); }
+      break;
+    case REG_QWORD:
+      if (size >= 8) { unsigned long long v; memcpy(&v, d, 8); _snwprintf(tmp, 63, L"0x%016llX", v); wb_adds(&b, tmp); }
+      break;
+    case REG_MULTI_SZ: {
+      const wchar_t *p = (const wchar_t *)d, *end = (const wchar_t *)(d + (size & ~1u));
+      BOOL first = TRUE;
+      while (p < end && *p) {
+        size_t l = wcsnlen(p, (size_t)(end - p));
+        if (!first) wb_adds(&b, L" | ");
+        wb_esc2(&b, p, l);
+        first = FALSE;
+        p += l + 1;
+      }
+      break;
+    }
+    default:
+      for (i = 0; i < size; i++) { _snwprintf(tmp, 8, L"%02X", d[i]); wb_adds(&b, tmp); }
+  }
+  if (!b.p) b.p = (wchar_t *)calloc(1, sizeof(wchar_t));
+  return b.p;
+}
+
+static void NowStr(wchar_t *out, size_t cap)
+{
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  _snwprintf(out, cap - 1, L"%04d-%02d-%02d %02d:%02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+  out[cap - 1] = 0;
+}
+
+/* ---- сканирование реестра в файл снимка ---- */
+typedef struct {
+  HANDLE f;
+  char *buf;
+  size_t n, cap;
+  DWORD keys, vals, errs;
+  const Scope *scope;
+  BOOL ioerr;
+} ScanCtx;
+
+static void sc_flush(ScanCtx *c)
+{
+  DWORD w = 0;
+  if (c->n) {
+    if (!WriteFile(c->f, c->buf, (DWORD)c->n, &w, NULL) || w != c->n) c->ioerr = TRUE;
+    c->n = 0;
+  }
+}
+
+static void sc_line(ScanCtx *c, const wchar_t *w)
+{
+  int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+  if (c->n + need + 2 > c->cap) {
+    sc_flush(c);
+    if ((size_t)need + 2 > c->cap) { c->cap = (size_t)need + 4096; c->buf = (char *)realloc(c->buf, c->cap); }
+  }
+  WideCharToMultiByte(CP_UTF8, 0, w, -1, c->buf + c->n, need, NULL, NULL);
+  c->n += need - 1;
+  c->buf[c->n++] = '\n';
+}
+
+static HKEY HiveFromName(const wchar_t *full)
+{
+  if (IsUnderPath(full, L"HKEY_LOCAL_MACHINE")) return HKEY_LOCAL_MACHINE;
+  if (IsUnderPath(full, L"HKEY_CURRENT_USER")) return HKEY_CURRENT_USER;
+  if (IsUnderPath(full, L"HKEY_CLASSES_ROOT")) return HKEY_CLASSES_ROOT;
+  if (IsUnderPath(full, L"HKEY_USERS")) return HKEY_USERS;
+  if (IsUnderPath(full, L"HKEY_CURRENT_CONFIG")) return HKEY_CURRENT_CONFIG;
+  return NULL;
+}
+
+static void ScanKey(ScanCtx *c, HKEY h, const wchar_t *path, int depth)
+{
+  DWORD nsub = 0, maxsub = 0, nval = 0, maxname = 0, maxdata = 0, i;
+  ValEnt *vals = NULL;
+  int nv = 0, k;
+  WBuf lb = { 0 };
+  if (g_cancel) return;
+  if (RegQueryInfoKeyW(h, NULL, NULL, NULL, &nsub, &maxsub, NULL, &nval, &maxname, &maxdata, NULL, NULL) != ERROR_SUCCESS) {
+    c->errs++;
+    return;
+  }
+  wb_adds(&lb, L"K\t"); wb_adds(&lb, path);
+  sc_line(c, lb.p);
+  free(lb.p); lb.p = NULL; lb.n = lb.cap = 0;
+  c->keys++;
+  if ((c->keys & 255) == 0) SetBusy(L"Веток: %lu, значений: %lu  —  %ls", c->keys, c->vals, path);
+
+  if (nval) {
+    wchar_t *nm = (wchar_t *)malloc((maxname + 2) * sizeof(wchar_t));
+    DWORD dcap = maxdata + 16;
+    BYTE *dt = (BYTE *)malloc(dcap);
+    vals = (ValEnt *)calloc(nval, sizeof(ValEnt));
+    for (i = 0; i < nval; i++) {
+      DWORD nl = maxname + 1, dl = dcap - 8, ty = 0;
+      LONG r = RegEnumValueW(h, i, nm, &nl, NULL, &ty, dt, &dl);
+      if (r == ERROR_MORE_DATA) {
+        dcap = dl + 16;
+        dt = (BYTE *)realloc(dt, dcap);
+        nl = maxname + 1; dl = dcap - 8;
+        r = RegEnumValueW(h, i, nm, &nl, NULL, &ty, dt, &dl);
+      }
+      if (r == ERROR_NO_MORE_ITEMS) break;
+      if (r != ERROR_SUCCESS) continue;
+      vals[nv].name = Dup(nm);
+      vals[nv].type = ty;
+      vals[nv].size = dl;
+      vals[nv].data = (BYTE *)malloc(dl + 1);
+      memcpy(vals[nv].data, dt, dl);
+      nv++;
+    }
+    free(nm); free(dt);
+    qsort(vals, nv, sizeof(ValEnt), QsCmpVal);
+    for (k = 0; k < nv; k++) {
+      WBuf vb = { 0 };
+      wchar_t num[48], *repr = ValRepr(vals[k].type, vals[k].data, vals[k].size);
+      wb_adds(&vb, L"V\t");
+      wb_esc2(&vb, vals[k].name, wcslen(vals[k].name));
+      _snwprintf(num, 47, L"\t%lu\t%lu\t", vals[k].type, vals[k].size);
+      wb_adds(&vb, num);
+      wb_adds(&vb, repr);
+      sc_line(c, vb.p);
+      c->vals++;
+      free(vb.p); free(repr);
+      free(vals[k].name); free(vals[k].data);
+    }
+    free(vals);
+  }
+
+  if (nsub && depth < 500) {
+    wchar_t **names = (wchar_t **)calloc(nsub, sizeof(wchar_t *));
+    wchar_t *nm = (wchar_t *)malloc((maxsub + 2) * sizeof(wchar_t));
+    int nn = 0;
+    for (i = 0; i < nsub; i++) {
+      DWORD nl = maxsub + 1;
+      LONG r = RegEnumKeyExW(h, i, nm, &nl, NULL, NULL, NULL, NULL);
+      if (r == ERROR_NO_MORE_ITEMS) break;
+      if (r != ERROR_SUCCESS) continue;
+      names[nn++] = Dup(nm);
+    }
+    free(nm);
+    qsort(names, nn, sizeof(wchar_t *), QsCmpStr);
+    for (k = 0; k < nn; k++) {
+      size_t cl = wcslen(path) + wcslen(names[k]) + 2, q;
+      wchar_t *child = (wchar_t *)malloc(cl * sizeof(wchar_t));
+      HKEY sub;
+      LONG r;
+      _snwprintf(child, cl - 1, L"%ls\\%ls", path, names[k]);
+      child[cl - 1] = 0;
+      for (q = 0; child[q]; q++) if (child[q] < 32) child[q] = L'?';
+      if (g_cancel) { free(child); free(names[k]); continue; }
+      {
+        BOOL excluded = FALSE;
+        int e;
+        for (e = 0; e < c->scope->nexcl; e++) if (IsUnderPath(child, c->scope->excl[e])) { excluded = TRUE; break; }
+        if (!excluded && _wcsicmp(child, L"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet") == 0) excluded = TRUE; /* символическая ссылка на ControlSet001 */
+        if (!excluded) {
+          r = RegOpenKeyExW(h, names[k], 0, KEY_READ | KEY_WOW64_64KEY, &sub);
+          if (r == ERROR_SUCCESS) { ScanKey(c, sub, child, depth + 1); RegCloseKey(sub); }
+          else {
+            WBuf eb = { 0 };
+            wb_adds(&eb, L"K\t"); wb_adds(&eb, child);
+            sc_line(c, eb.p); sc_line(c, L"X");
+            free(eb.p);
+            c->keys++; c->errs++;
+            if (c->errs <= 20) Log(L"Нет доступа к ветке (%ld): %ls", r, child);
+          }
+        }
+      }
+      free(child);
+      free(names[k]);
+    }
+    free(names);
+  }
+}
+
+typedef struct {
+  Scope scope;
+  wchar_t file[MAX_PATH + 16], name[200], start[32];
+  DWORD keys, vals, errs;
+  BOOL ok, canceled;
+} ScanJob;
+
+static void HdrLine(ScanCtx *c, const wchar_t *tag, const wchar_t *val)
+{
+  WBuf b = { 0 };
+  wb_adds(&b, tag);
+  wb_addc(&b, L'\t');
+  wb_esc2(&b, val, wcslen(val));
+  sc_line(c, b.p);
+  free(b.p);
+}
+
+static BOOL DoScanToFile(ScanJob *j)
+{
+  ScanCtx c;
+  int i;
+  wchar_t endt[32], st[96], **sorted;
+  memset(&c, 0, sizeof c);
+  c.f = CreateFileW(j->file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (c.f == INVALID_HANDLE_VALUE) return FALSE;
+  c.cap = 1 << 20;
+  c.buf = (char *)malloc(c.cap);
+  c.scope = &j->scope;
+  NowStr(j->start, 32);
+  sc_line(&c, L"#KSNAP\t1");
+  HdrLine(&c, L"#NAME", j->name);
+  HdrLine(&c, L"#TIME", j->start);
+  for (i = 0; i < j->scope.nroots; i++) HdrLine(&c, L"#ROOT", j->scope.roots[i]);
+  for (i = 0; i < j->scope.nexcl; i++) HdrLine(&c, L"#EXCL", j->scope.excl[i]);
+  sc_line(&c, L"#DATA");
+  sorted = (wchar_t **)malloc((j->scope.nroots + 1) * sizeof(wchar_t *));
+  for (i = 0; i < j->scope.nroots; i++) sorted[i] = j->scope.roots[i];
+  qsort(sorted, j->scope.nroots, sizeof(wchar_t *), QsCmpPath);
+  for (i = 0; i < j->scope.nroots && !g_cancel; i++) {
+    HKEY hive = HiveFromName(sorted[i]), h;
+    const wchar_t *sub;
+    LONG r;
+    if (!hive || !InScope(&j->scope, sorted[i])) continue;
+    sub = wcschr(sorted[i], L'\\');
+    sub = sub ? sub + 1 : L"";
+    r = RegOpenKeyExW(hive, sub, 0, KEY_READ | KEY_WOW64_64KEY, &h);
+    if (r == ERROR_SUCCESS) { ScanKey(&c, h, sorted[i], 0); RegCloseKey(h); }
+    else {
+      WBuf eb = { 0 };
+      wb_adds(&eb, L"K\t"); wb_adds(&eb, sorted[i]);
+      sc_line(&c, eb.p); sc_line(&c, L"X");
+      free(eb.p);
+      c.keys++; c.errs++;
+      Log(L"Нет доступа к корневой ветке (%ld): %ls", r, sorted[i]);
+    }
+  }
+  free(sorted);
+  NowStr(endt, 32);
+  HdrLine(&c, L"#END", endt);
+  _snwprintf(st, 95, L"%lu\t%lu\t%lu", c.keys, c.vals, c.errs);
+  {
+    WBuf b = { 0 };
+    wb_adds(&b, L"#STATS\t"); wb_adds(&b, st);
+    sc_line(&c, b.p);
+    free(b.p);
+    sc_flush(&c);
+  }
+  CloseHandle(c.f);
+  free(c.buf);
+  j->keys = c.keys; j->vals = c.vals; j->errs = c.errs;
+  j->canceled = g_cancel != 0;
+  j->ok = !c.ioerr && !j->canceled;
+  if (!j->ok) DeleteFileW(j->file);
+  Log(L"Снимок: %ls, веток %lu, значений %lu, ошибок доступа %lu, итог %ls", j->file, c.keys, c.vals, c.errs, j->ok ? L"ok" : L"сбой/отмена");
+  return j->ok;
+}
+
+static DWORD WINAPI ScanWorker(LPVOID p)
+{
+  DoScanToFile((ScanJob *)p);
+  SetBusy(L"Готово");
+  return 0;
+}
+
+/* ---- сведения о снимках ---- */
+typedef struct {
+  wchar_t file[MAX_PATH + 16], name[200], start[32], end[32], rootsText[600];
+  DWORD keys, vals, errs;
+  unsigned long long bytes;
+  BOOL valid, complete;
+} SnapInfo;
+
+static SnapInfo *g_snaps;
+static int g_nsnaps;
+
+/* разбор строк заголовка; sc может быть NULL */
+static void ParseHdr(const wchar_t *text, SnapInfo *si, Scope *sc, BOOL stopAtData)
+{
+  const wchar_t *p = text;
+  while (*p) {
+    const wchar_t *eol = p, *tab;
+    size_t tl;
+    while (*eol && *eol != L'\n') eol++;
+    tab = p;
+    while (tab < eol && *tab != L'\t') tab++;
+    tl = (size_t)(tab - p);
+    if (tl == 5 && !wcsncmp(p, L"#DATA", 5)) { if (stopAtData) return; }
+    else if (tab < eol || tl) {
+      size_t vl = (size_t)(eol - (tab < eol ? tab + 1 : eol));
+      const wchar_t *vs = tab < eol ? tab + 1 : eol;
+      if (vl && vs[vl - 1] == L'\r') vl--;
+      if (tl == 5 && !wcsncmp(p, L"#NAME", 5)) { wchar_t *v = Unesc2(vs, vl); wcsncpy(si->name, v, 199); si->name[199] = 0; free(v); }
+      else if (tl == 5 && !wcsncmp(p, L"#TIME", 5)) { wcsncpy(si->start, vs, vl < 31 ? vl : 31); si->start[vl < 31 ? vl : 31] = 0; }
+      else if (tl == 4 && !wcsncmp(p, L"#END", 4)) { wcsncpy(si->end, vs, vl < 31 ? vl : 31); si->end[vl < 31 ? vl : 31] = 0; si->complete = TRUE; }
+      else if (tl == 6 && !wcsncmp(p, L"#STATS", 6)) {
+        wchar_t tmp[96];
+        size_t n = vl < 95 ? vl : 95;
+        wcsncpy(tmp, vs, n); tmp[n] = 0;
+        swscanf(tmp, L"%lu\t%lu\t%lu", &si->keys, &si->vals, &si->errs);
+      }
+      else if (tl == 5 && !wcsncmp(p, L"#ROOT", 5)) {
+        wchar_t *v = Unesc2(vs, vl);
+        if (sc) ScAddRoot(sc, v);
+        if (wcslen(si->rootsText) + wcslen(v) + 4 < 599) { if (si->rootsText[0]) wcscat(si->rootsText, L"; "); wcscat(si->rootsText, v); }
+        free(v);
+      }
+      else if (tl == 5 && !wcsncmp(p, L"#EXCL", 5)) { if (sc) { wchar_t *v = Unesc2(vs, vl); ScAddExcl(sc, v); free(v); } }
+    }
+    p = *eol ? eol + 1 : eol;
+  }
+}
+
+static BYTE *ReadRange(const wchar_t *file, unsigned long long off, DWORD len, DWORD *got)
+{
+  HANDLE h = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+  LARGE_INTEGER li;
+  BYTE *b;
+  DWORD rd = 0;
+  if (h == INVALID_HANDLE_VALUE) return NULL;
+  li.QuadPart = (LONGLONG)off;
+  SetFilePointerEx(h, li, NULL, FILE_BEGIN);
+  b = (BYTE *)malloc(len + 4);
+  if (!ReadFile(h, b, len, &rd, NULL)) { free(b); CloseHandle(h); return NULL; }
+  CloseHandle(h);
+  b[rd] = b[rd + 1] = b[rd + 2] = b[rd + 3] = 0;
+  *got = rd;
+  return b;
+}
+
+static BOOL ReadSnapInfo(const wchar_t *file, SnapInfo *si)
+{
+  WIN32_FILE_ATTRIBUTE_DATA fa;
+  DWORD got;
+  BYTE *raw;
+  wchar_t *w;
+  memset(si, 0, sizeof *si);
+  wcsncpy(si->file, file, MAX_PATH + 15);
+  if (!GetFileAttributesExW(file, GetFileExInfoStandard, &fa)) return FALSE;
+  si->bytes = ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+  raw = ReadRange(file, 0, 65536, &got);
+  if (!raw) return FALSE;
+  w = Utf8ToWide(raw, got);
+  free(raw);
+  if (wcsncmp(w, L"#KSNAP", 6) != 0) { free(w); return FALSE; }
+  ParseHdr(w, si, NULL, TRUE);
+  free(w);
+  if (si->bytes > 2048) raw = ReadRange(file, si->bytes - 2048, 2048, &got);
+  else raw = ReadRange(file, 0, 2048, &got);
+  if (raw) {
+    w = Utf8ToWide(raw, got);
+    free(raw);
+    {
+      SnapInfo tail;
+      memset(&tail, 0, sizeof tail);
+      ParseHdr(w, &tail, NULL, FALSE);
+      si->complete = tail.complete;
+      wcscpy(si->end, tail.end);
+      si->keys = tail.keys; si->vals = tail.vals; si->errs = tail.errs;
+    }
+    free(w);
+  }
+  si->valid = TRUE;
+  return TRUE;
+}
+
+static BOOL LoadScope(const wchar_t *file, Scope *sc, SnapInfo *si)
+{
+  DWORD got;
+  BYTE *raw = ReadRange(file, 0, 1u << 20, &got);
+  wchar_t *w;
+  SnapInfo tmp;
+  if (!raw) return FALSE;
+  w = Utf8ToWide(raw, got);
+  free(raw);
+  memset(&tmp, 0, sizeof tmp);
+  if (wcsncmp(w, L"#KSNAP", 6) != 0) { free(w); return FALSE; }
+  ParseHdr(w, si ? si : &tmp, sc, TRUE);
+  free(w);
+  return TRUE;
+}
+
+static int QsCmpSnap(const void *a, const void *b) { return wcscmp(((const SnapInfo *)a)->start, ((const SnapInfo *)b)->start); }
+
+static void SnapRefreshUI(void);
+
+static void SnapListRefresh(void)
+{
+  WIN32_FIND_DATAW fd;
+  HANDLE h;
+  wchar_t pat[MAX_PATH + 8], full[MAX_PATH + 24];
+  int i, cap = 0;
+  free(g_snaps);
+  g_snaps = NULL;
+  g_nsnaps = 0;
+  CreateDirectoryW(g_snapDir, NULL);
+  _snwprintf(pat, MAX_PATH + 7, L"%ls\\*.ksn", g_snapDir);
+  h = FindFirstFileW(pat, &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      SnapInfo si;
+      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+      _snwprintf(full, MAX_PATH + 23, L"%ls\\%ls", g_snapDir, fd.cFileName);
+      if (!ReadSnapInfo(full, &si)) continue;
+      if (g_nsnaps == cap) { cap = cap ? cap * 2 : 32; g_snaps = (SnapInfo *)realloc(g_snaps, cap * sizeof(SnapInfo)); }
+      g_snaps[g_nsnaps++] = si;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  if (g_nsnaps > 1) qsort(g_snaps, g_nsnaps, sizeof(SnapInfo), QsCmpSnap);
+  ListView_DeleteAllItems(g_hSnapLV);
+  for (i = 0; i < g_nsnaps; i++) {
+    LVITEMW it;
+    wchar_t num[32];
+    memset(&it, 0, sizeof it);
+    it.mask = LVIF_TEXT; it.iItem = i; it.pszText = g_snaps[i].start;
+    ListView_InsertItem(g_hSnapLV, &it);
+    ListView_SetItemText(g_hSnapLV, i, 1, g_snaps[i].name);
+    _snwprintf(num, 31, L"%lu", g_snaps[i].keys);
+    ListView_SetItemText(g_hSnapLV, i, 2, num);
+    _snwprintf(num, 31, L"%lu", g_snaps[i].vals);
+    ListView_SetItemText(g_hSnapLV, i, 3, num);
+  }
+  SnapRefreshUI();
+}
+
+/* ---- читатель снимка (поблочно: ветка и её значения) ---- */
+typedef struct { FILE *f; char *buf; wchar_t *wl; BOOL have; } Reader;
+typedef struct { wchar_t *name; DWORD type, size; wchar_t *repr; } ValLine;
+typedef struct { wchar_t *path; ValLine *v; int nv, cap; BOOL unreadable; } KBlock;
+
+static BOOL RdNextLine(Reader *r)
+{
+  size_t n;
+  if (!fgets(r->buf, 65536, r->f)) return FALSE;
+  n = strlen(r->buf);
+  while (n > 0 && (r->buf[n - 1] == '\n' || r->buf[n - 1] == '\r')) r->buf[--n] = 0;
+  MultiByteToWideChar(CP_UTF8, 0, r->buf, -1, r->wl, 65536);
+  r->wl[65535] = 0;
+  return TRUE;
+}
+
+static BOOL RdOpen(Reader *r, const wchar_t *file)
+{
+  memset(r, 0, sizeof *r);
+  r->f = _wfopen(file, L"rb");
+  if (!r->f) return FALSE;
+  setvbuf(r->f, NULL, _IOFBF, 1 << 20);
+  r->buf = (char *)malloc(65536);
+  r->wl = (wchar_t *)malloc(65536 * sizeof(wchar_t));
+  while (RdNextLine(r)) if (!wcscmp(r->wl, L"#DATA")) return TRUE;
+  return FALSE;
+}
+
+static void RdClose(Reader *r)
+{
+  if (r->f) fclose(r->f);
+  free(r->buf); free(r->wl);
+  memset(r, 0, sizeof *r);
+}
+
+static void FreeBlock(KBlock *b)
+{
+  int i;
+  for (i = 0; i < b->nv; i++) { free(b->v[i].name); free(b->v[i].repr); }
+  free(b->v); free(b->path);
+  memset(b, 0, sizeof *b);
+}
+
+static BOOL RdBlock(Reader *r, KBlock *b)
+{
+  memset(b, 0, sizeof *b);
+  if (!r->have) { if (!RdNextLine(r)) return FALSE; }
+  r->have = FALSE;
+  if (r->wl[0] != L'K' || r->wl[1] != L'\t') return FALSE;
+  b->path = Dup(r->wl + 2);
+  while (RdNextLine(r)) {
+    if (r->wl[0] == L'V' && r->wl[1] == L'\t') {
+      wchar_t *p = r->wl + 2, *t1, *t2, *t3;
+      ValLine *v;
+      t1 = wcschr(p, L'\t');
+      if (!t1) continue;
+      t2 = wcschr(t1 + 1, L'\t');
+      if (!t2) continue;
+      t3 = wcschr(t2 + 1, L'\t');
+      if (!t3) continue;
+      if (b->nv == b->cap) { b->cap = b->cap ? b->cap * 2 : 8; b->v = (ValLine *)realloc(b->v, b->cap * sizeof(ValLine)); }
+      v = &b->v[b->nv++];
+      v->name = Unesc2(p, (size_t)(t1 - p));
+      v->type = (DWORD)wcstoul(t1 + 1, NULL, 10);
+      v->size = (DWORD)wcstoul(t2 + 1, NULL, 10);
+      v->repr = Dup(t3 + 1);
+    } else if (r->wl[0] == L'X') b->unreadable = TRUE;
+    else { r->have = TRUE; break; }
+  }
+  return TRUE;
+}
+
+/* ---- результат сравнения ---- */
+enum { DK_KEYADD = 1, DK_KEYDEL, DK_VALADD, DK_VALDEL, DK_VALCHG };
+typedef struct { int kind; wchar_t *key, *name, *o, *n; } DiffItem;
+static DiffItem *g_diff;
+static int g_ndiff, g_capdiff;
+static BOOL g_diffTrunc;
+static int g_cnt[6];
+static wchar_t g_cmpA[260], g_cmpB[260], g_cmpTimeA[32], g_cmpTimeB[32], g_cmpWhen[32];
+
+static void FreeDiff(void)
+{
+  int i;
+  for (i = 0; i < g_ndiff; i++) { free(g_diff[i].key); free(g_diff[i].name); free(g_diff[i].o); free(g_diff[i].n); }
+  free(g_diff);
+  g_diff = NULL; g_ndiff = g_capdiff = 0; g_diffTrunc = FALSE;
+  memset(g_cnt, 0, sizeof g_cnt);
+}
+
+static void AddDiff(int kind, const wchar_t *key, const wchar_t *name, const wchar_t *o, const wchar_t *n)
+{
+  DiffItem *d;
+  g_cnt[kind]++;
+  if (g_ndiff >= 300000) { g_diffTrunc = TRUE; return; }
+  if (g_ndiff == g_capdiff) { g_capdiff = g_capdiff ? g_capdiff * 2 : 1024; g_diff = (DiffItem *)realloc(g_diff, g_capdiff * sizeof(DiffItem)); }
+  d = &g_diff[g_ndiff++];
+  d->kind = kind;
+  d->key = Dup(key);
+  d->name = name ? Dup(name) : NULL;
+  d->o = o ? Dup(o) : NULL;
+  d->n = n ? Dup(n) : NULL;
+}
+
+static const wchar_t *TypeName(DWORD t, wchar_t *tmp)
+{
+  switch (t) {
+    case 0: return L"REG_NONE"; case 1: return L"REG_SZ"; case 2: return L"REG_EXPAND_SZ"; case 3: return L"REG_BINARY";
+    case 4: return L"REG_DWORD"; case 5: return L"REG_DWORD_BIG_ENDIAN"; case 6: return L"REG_LINK"; case 7: return L"REG_MULTI_SZ";
+    case 11: return L"REG_QWORD";
+  }
+  _snwprintf(tmp, 31, L"REG_(%lu)", t);
+  tmp[31] = 0;
+  return tmp;
+}
+
+static wchar_t *FmtVal(const ValLine *v)
+{
+  WBuf b = { 0 };
+  wchar_t tmp[64], *un, *q;
+  wb_adds(&b, TypeName(v->type, tmp));
+  wb_adds(&b, L"  ");
+  if (v->size > 512) {
+    _snwprintf(tmp, 63, L"(данные %lu байт, хэш %ls)", v->size, v->repr + 1);
+    wb_adds(&b, tmp);
+  } else {
+    un = Unesc2(v->repr, wcslen(v->repr));
+    for (q = un; *q; q++) if (*q == L'\r' || *q == L'\n' || *q == L'\t') *q = L' ';
+    if (v->type == REG_SZ || v->type == REG_EXPAND_SZ || v->type == REG_MULTI_SZ) {
+      wb_addc(&b, L'"'); wb_adds(&b, un); wb_addc(&b, L'"');
+    } else if (wcslen(un) > 160) {
+      wchar_t cut[170];
+      wcsncpy(cut, un, 160); cut[160] = 0;
+      wb_adds(&b, cut); wb_adds(&b, L"...");
+    } else wb_adds(&b, un);
+    free(un);
+  }
+  return b.p;
+}
+
+static BOOL InScopeBoth(const Scope *a, const Scope *b, const wchar_t *path) { return InScope(a, path) && InScope(b, path); }
+
+static void ListBlockAs(KBlock *k, int keyKind, int valKind)
+{
+  int i;
+  AddDiff(keyKind, k->path, NULL, NULL, NULL);
+  for (i = 0; i < k->nv; i++) {
+    wchar_t *s = FmtVal(&k->v[i]);
+    if (valKind == DK_VALDEL) AddDiff(valKind, k->path, k->v[i].name, s, NULL);
+    else AddDiff(valKind, k->path, k->v[i].name, NULL, s);
+    free(s);
+  }
+}
+
+static void CompareBlocks(KBlock *a, KBlock *b)
+{
+  int i = 0, j = 0;
+  if (a->unreadable || b->unreadable) return;
+  while (i < a->nv || j < b->nv) {
+    int c;
+    if (i >= a->nv) c = 1; else if (j >= b->nv) c = -1;
+    else c = CmpName(a->v[i].name, wcslen(a->v[i].name), b->v[j].name, wcslen(b->v[j].name));
+    if (c < 0) { wchar_t *s = FmtVal(&a->v[i]); AddDiff(DK_VALDEL, a->path, a->v[i].name, s, NULL); free(s); i++; }
+    else if (c > 0) { wchar_t *s = FmtVal(&b->v[j]); AddDiff(DK_VALADD, a->path, b->v[j].name, NULL, s); free(s); j++; }
+    else {
+      if (a->v[i].type != b->v[j].type || a->v[i].size != b->v[j].size || wcscmp(a->v[i].repr, b->v[j].repr) != 0) {
+        wchar_t *so = FmtVal(&a->v[i]), *sn = FmtVal(&b->v[j]);
+        AddDiff(DK_VALCHG, a->path, a->v[i].name, so, sn);
+        free(so); free(sn);
+      }
+      i++; j++;
+    }
+  }
+}
+
+static void MergeDiff(Reader *ra, Reader *rb, const Scope *sa, const Scope *sb)
+{
+  KBlock a, b;
+  BOOL okA = RdBlock(ra, &a), okB = RdBlock(rb, &b);
+  DWORD n = 0;
+  while ((okA || okB) && !g_cancel) {
+    int c;
+    if (!okA) c = 1; else if (!okB) c = -1; else c = CmpKeyPath(a.path, b.path);
+    if ((++n & 1023) == 0) SetBusy(L"Сравнение: обработано веток %lu, различий %d", n, g_cnt[1] + g_cnt[2] + g_cnt[3] + g_cnt[4] + g_cnt[5]);
+    if (c < 0) {
+      if (InScopeBoth(sa, sb, a.path) && !a.unreadable) ListBlockAs(&a, DK_KEYDEL, DK_VALDEL);
+      FreeBlock(&a); okA = RdBlock(ra, &a);
+    } else if (c > 0) {
+      if (InScopeBoth(sa, sb, b.path) && !b.unreadable) ListBlockAs(&b, DK_KEYADD, DK_VALADD);
+      FreeBlock(&b); okB = RdBlock(rb, &b);
+    } else {
+      if (InScopeBoth(sa, sb, a.path)) CompareBlocks(&a, &b);
+      FreeBlock(&a); FreeBlock(&b);
+      okA = RdBlock(ra, &a); okB = RdBlock(rb, &b);
+    }
+  }
+  if (okA) FreeBlock(&a);
+  if (okB) FreeBlock(&b);
+}
+
+typedef struct {
+  wchar_t fileA[MAX_PATH + 16], fileB[MAX_PATH + 16];
+  BOOL vsCurrent;
+  wchar_t tmpFile[MAX_PATH + 16], curName[200];
+  int result; /* 0 ошибка, 1 готово, 2 отмена */
+  wchar_t err[300];
+} CmpJob;
+
+static DWORD WINAPI CompareWorker(LPVOID p)
+{
+  CmpJob *j = (CmpJob *)p;
+  Scope sa, sb;
+  SnapInfo ia, ib;
+  Reader ra, rb;
+  memset(&sa, 0, sizeof sa); memset(&sb, 0, sizeof sb);
+  memset(&ia, 0, sizeof ia); memset(&ib, 0, sizeof ib);
+  j->result = 0;
+  if (!LoadScope(j->fileA, &sa, &ia)) { _snwprintf(j->err, 299, L"Не удалось прочитать снимок:\n%ls", j->fileA); return 0; }
+  if (j->vsCurrent) {
+    ScanJob *sj = (ScanJob *)calloc(1, sizeof *sj);
+    int i;
+    for (i = 0; i < sa.nroots; i++) ScAddRoot(&sj->scope, sa.roots[i]);
+    for (i = 0; i < sa.nexcl; i++) ScAddExcl(&sj->scope, sa.excl[i]);
+    wcscpy(sj->file, j->tmpFile);
+    wcscpy(sj->name, j->curName);
+    SetBusy(L"Снимок текущего состояния...");
+    if (!DoScanToFile(sj)) {
+      j->result = g_cancel ? 2 : 0;
+      if (!g_cancel) _snwprintf(j->err, 299, L"Не удалось сделать снимок текущего состояния.");
+      ScFree(&sj->scope); free(sj); ScFree(&sa);
+      return 0;
+    }
+    wcscpy(j->fileB, j->tmpFile);
+    wcscpy(g_cmpTimeB, sj->start);
+    ScFree(&sj->scope); free(sj);
+  }
+  if (!LoadScope(j->fileB, &sb, &ib)) { _snwprintf(j->err, 299, L"Не удалось прочитать снимок:\n%ls", j->fileB); ScFree(&sa); return 0; }
+  wcsncpy(g_cmpA, ia.name, 259); wcsncpy(g_cmpTimeA, ia.start, 31);
+  if (!j->vsCurrent) { wcsncpy(g_cmpB, ib.name, 259); wcsncpy(g_cmpTimeB, ib.start, 31); }
+  if (!RdOpen(&ra, j->fileA)) { _snwprintf(j->err, 299, L"Не удалось открыть снимок."); ScFree(&sa); ScFree(&sb); return 0; }
+  if (!RdOpen(&rb, j->fileB)) { RdClose(&ra); _snwprintf(j->err, 299, L"Не удалось открыть снимок."); ScFree(&sa); ScFree(&sb); return 0; }
+  MergeDiff(&ra, &rb, &sa, &sb);
+  RdClose(&ra); RdClose(&rb);
+  ScFree(&sa); ScFree(&sb);
+  j->result = g_cancel ? 2 : 1;
+  SetBusy(L"Готово");
+  return 0;
+}
+
+/* ---- отчёт ---- */
+static const wchar_t *KindLabel(int k)
+{
+  switch (k) {
+    case DK_KEYADD: return L"Добавлена ветка"; case DK_KEYDEL: return L"Удалена ветка";
+    case DK_VALADD: return L"Добавлено значение"; case DK_VALDEL: return L"Удалено значение"; case DK_VALCHG: return L"Изменено значение";
+  }
+  return L"";
+}
+
+static BOOL WriteUtf8Bom(const wchar_t *file, const wchar_t *text)
+{
+  int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL);
+  char *u = (char *)malloc(n + 4);
+  HANDLE h;
+  DWORD w = 0;
+  BOOL ok;
+  static const BYTE bom[3] = { 0xEF, 0xBB, 0xBF };
+  WideCharToMultiByte(CP_UTF8, 0, text, -1, u, n, NULL, NULL);
+  h = CreateFileW(file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) { free(u); return FALSE; }
+  ok = WriteFile(h, bom, 3, &w, NULL) && WriteFile(h, u, (DWORD)(n - 1), &w, NULL);
+  CloseHandle(h);
+  free(u);
+  return ok;
+}
+
+static void BuildSummary(wchar_t *out, size_t cap)
+{
+  _snwprintf(out, cap - 1, L"Добавлено веток: %d, удалено веток: %d. Значений: добавлено %d, удалено %d, изменено %d.%ls",
+             g_cnt[DK_KEYADD], g_cnt[DK_KEYDEL], g_cnt[DK_VALADD], g_cnt[DK_VALDEL], g_cnt[DK_VALCHG],
+             g_diffTrunc ? L" (в списке показаны первые 300000 различий)" : L"");
+  out[cap - 1] = 0;
+}
+
+static BOOL WriteReport(const wchar_t *file)
+{
+  WBuf b = { 0 };
+  wchar_t tmp[1200], sum[600];
+  int i;
+  const wchar_t *lastKey = NULL;
+  wb_adds(&b, L"Key Shelf Reg Jumper — отчёт сравнения реестра\r\n");
+  _snwprintf(tmp, 1199, L"Отчёт создан: %ls\r\n", g_cmpWhen); wb_adds(&b, tmp);
+  _snwprintf(tmp, 1199, L"Было  (эталон):  %ls  [снимок от %ls]\r\n", g_cmpA, g_cmpTimeA); wb_adds(&b, tmp);
+  _snwprintf(tmp, 1199, L"Стало (сравнение): %ls  [состояние на %ls]\r\n", g_cmpB, g_cmpTimeB); wb_adds(&b, tmp);
+  BuildSummary(sum, 600);
+  wb_adds(&b, L"Итого: "); wb_adds(&b, sum);
+  wb_adds(&b, L"\r\n================================================================\r\n\r\n");
+  for (i = 0; i < g_ndiff; i++) {
+    DiffItem *d = &g_diff[i];
+    if (!lastKey || wcscmp(lastKey, d->key) != 0) {
+      const wchar_t *hdr = d->kind == DK_KEYADD ? L"[ДОБАВЛЕНА ВЕТКА]" : d->kind == DK_KEYDEL ? L"[УДАЛЕНА ВЕТКА]" : L"[ИЗМЕНЕНА ВЕТКА]";
+      wb_adds(&b, L"\r\n"); wb_adds(&b, hdr); wb_addc(&b, L' '); wb_adds(&b, d->key); wb_adds(&b, L"\r\n");
+      lastKey = d->key;
+    }
+    if (d->kind == DK_KEYADD || d->kind == DK_KEYDEL) continue;
+    {
+      const wchar_t *nm = d->name && d->name[0] ? d->name : L"(по умолчанию)";
+      if (d->kind == DK_VALADD) { wb_adds(&b, L"  + Значение: "); wb_adds(&b, nm); wb_adds(&b, L"\r\n      Стало: "); wb_adds(&b, d->n ? d->n : L""); wb_adds(&b, L"\r\n"); }
+      else if (d->kind == DK_VALDEL) { wb_adds(&b, L"  - Значение: "); wb_adds(&b, nm); wb_adds(&b, L"\r\n      Было:  "); wb_adds(&b, d->o ? d->o : L""); wb_adds(&b, L"\r\n"); }
+      else { wb_adds(&b, L"  ~ Значение: "); wb_adds(&b, nm); wb_adds(&b, L"\r\n      Было:  "); wb_adds(&b, d->o ? d->o : L""); wb_adds(&b, L"\r\n      Стало: "); wb_adds(&b, d->n ? d->n : L""); wb_adds(&b, L"\r\n"); }
+    }
+  }
+  if (g_diffTrunc) wb_adds(&b, L"\r\n... отчёт обрезан: слишком много различий (показаны первые 300000).\r\n");
+  if (g_ndiff == 0) wb_adds(&b, L"Различий не найдено.\r\n");
+  {
+    BOOL ok = WriteUtf8Bom(file, b.p ? b.p : L"");
+    free(b.p);
+    return ok;
+  }
+}
+
+/* ---- интерфейс вкладки «Сравнение» ---- */
+static void SnapSelected(int *idx, int *n)
+{
+  int i = -1, c = 0;
+  while ((i = ListView_GetNextItem(g_hSnapLV, i, LVNI_SELECTED)) >= 0) { if (c < 2) idx[c] = i; c++; }
+  *n = c;
+}
+
+static void SnapRefreshUI(void)
+{
+  int idx[2] = { -1, -1 }, n = 0;
+  wchar_t info[1800], tmp[900];
+  SnapSelected(idx, &n);
+  info[0] = 0;
+  if (n == 0) wcscpy(info, L"Выберите снимок. Один снимок — сравнить с текущим состоянием реестра, два снимка — сравнить между собой.");
+  else if (n == 1 && idx[0] < g_nsnaps) {
+    SnapInfo *s = &g_snaps[idx[0]];
+    _snwprintf(info, 1799, L"Снимок: %ls\r\nСоздан: %ls, завершён: %ls%ls\r\nВеток: %lu, значений: %lu, без доступа: %lu\r\nОбласти: %ls",
+               s->name, s->start, s->complete ? s->end : L"(не завершён)", L"", s->keys, s->vals, s->errs, s->rootsText);
+  } else if (n == 2 && idx[0] < g_nsnaps && idx[1] < g_nsnaps) {
+    _snwprintf(info, 1799, L"Сравнение двух снимков:\r\n%ls (%ls)  →  %ls (%ls)", g_snaps[idx[0]].name, g_snaps[idx[0]].start, g_snaps[idx[1]].name, g_snaps[idx[1]].start);
+  } else wcscpy(info, L"Выберите один или два снимка.");
+  if (g_cmpSummary[0]) { _snwprintf(tmp, 899, L"\r\n\r\nПоследнее сравнение: %ls", g_cmpSummary); wcsncat(info, tmp, 1799 - wcslen(info)); }
+  info[1799] = 0;
+  SetWindowTextW(g_hSnapInfo, info);
+  {
+    wchar_t cnt[100];
+    _snwprintf(cnt, 99, L"Снимков: %d", g_nsnaps);
+    if (g_tab == 2) SetWindowTextW(g_hCount, cnt);
+  }
+  if (g_tab == 2) {
+    EnableWindow(g_hBtnJumpNew, n == 1 || n == 2);
+    EnableWindow(g_hBtnX[0], g_lastReport[0] != 0);
+    EnableWindow(g_hBtnX[2], n >= 1);
+  }
+}
+
+static void DiffViewRefresh(void)
+{
+  ListView_SetItemCountEx(g_hDiffLV, g_ndiff, 0);
+  InvalidateRect(g_hDiffLV, NULL, TRUE);
+}
+
+static LRESULT DiffLvNotify(NMHDR *nh, LPARAM lp)
+{
+  if (nh->code == LVN_GETDISPINFOW) {
+    NMLVDISPINFOW *di = (NMLVDISPINFOW *)lp;
+    int i = di->item.iItem;
+    if ((di->item.mask & LVIF_TEXT) && i >= 0 && i < g_ndiff) {
+      DiffItem *d = &g_diff[i];
+      switch (di->item.iSubItem) {
+        case 0: di->item.pszText = (LPWSTR)KindLabel(d->kind); break;
+        case 1: di->item.pszText = d->key; break;
+        case 2: di->item.pszText = d->name ? (d->name[0] ? d->name : (LPWSTR)L"(по умолчанию)") : (LPWSTR)L""; break;
+        case 3: di->item.pszText = d->o ? d->o : (LPWSTR)L""; break;
+        case 4: di->item.pszText = d->n ? d->n : (LPWSTR)L""; break;
+      }
+    }
+  }
+  return 0;
+}
+
+static LRESULT SnapLvNotify(NMHDR *nh, LPARAM lp)
+{
+  (void)lp;
+  if (nh->code == LVN_ITEMCHANGED) { SnapRefreshUI(); return 0; }
+  if (nh->code == NM_DBLCLK) { PostMessageW(g_hMain, WM_COMMAND, IDM_SNAPCMP, 0); return 0; }
+  return 0;
+}
+
+/* ---- диалог «Сделать снимок» ---- */
+typedef struct {
+  HWND hwnd, eName, cBook, cHklm, cHkcu, cHku, eManual, cExcl;
+  int nBook;
+  BOOL done, ok, useBook, hklm, hkcu, hku, useExcl;
+  wchar_t name[200];
+  wchar_t *manual;
+} SnapDlg;
+
+static LRESULT CALLBACK SnapProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+  SnapDlg *d = (SnapDlg *)GetWindowLongPtrW(h, GWLP_USERDATA);
+  switch (m) {
+    case WM_CREATE: {
+      CREATESTRUCTW *cs = (CREATESTRUCTW *)lp;
+      int y = 8, W = 544;
+      wchar_t t[200];
+      d = (SnapDlg *)cs->lpCreateParams;
+      SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)d);
+      d->hwnd = h;
+      Mk(h, L"STATIC", L"Название снимка (например, «Эталон до установки»):", 0, 8, y, W, 16, 90, 0); y += 18;
+      d->eName = Mk(h, L"EDIT", L"Снимок", WS_TABSTOP | ES_AUTOHSCROLL, 8, y, W, 22, IDS_NAME, WS_EX_CLIENTEDGE); y += 32;
+      SendMessageW(d->eName, EM_LIMITTEXT, 100, 0);
+      _snwprintf(t, 199, L"Ветки из закладок (отмеченные или выбранная): %d шт.", d->nBook);
+      d->cBook = Mk(h, L"BUTTON", t, WS_TABSTOP | BS_AUTOCHECKBOX, 8, y, W, 20, IDS_BOOK, 0); y += 28;
+      if (d->nBook > 0) SendMessageW(d->cBook, BM_SETCHECK, BST_CHECKED, 0); else EnableWindow(d->cBook, FALSE);
+      Mk(h, L"STATIC", L"Целые разделы реестра (долго: от десятков секунд до нескольких минут):", 0, 8, y, W, 16, 91, 0); y += 20;
+      d->cHklm = Mk(h, L"BUTTON", L"HKEY_LOCAL_MACHINE (настройки компьютера, службы, программы)", WS_TABSTOP | BS_AUTOCHECKBOX, 24, y, W - 16, 20, IDS_HKLM, 0); y += 22;
+      d->cHkcu = Mk(h, L"BUTTON", L"HKEY_CURRENT_USER (настройки текущего пользователя, автозагрузка)", WS_TABSTOP | BS_AUTOCHECKBOX, 24, y, W - 16, 20, IDS_HKCU, 0); y += 22;
+      d->cHku = Mk(h, L"BUTTON", L"HKEY_USERS (все профили пользователей)", WS_TABSTOP | BS_AUTOCHECKBOX, 24, y, W - 16, 20, IDS_HKU, 0); y += 30;
+      Mk(h, L"STATIC", L"Дополнительные ветки (по одной в строке):", 0, 8, y, W, 16, 92, 0); y += 18;
+      d->eManual = Mk(h, L"EDIT", L"", WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN, 8, y, W, 80, IDS_MANUAL, WS_EX_CLIENTEDGE); y += 90;
+      d->cExcl = Mk(h, L"BUTTON", L"Не учитывать «шумные» ветки (список в файле snapshot_exclude.txt)", WS_TABSTOP | BS_AUTOCHECKBOX, 8, y, W - 120, 20, IDS_EXCL, 0);
+      SendMessageW(d->cExcl, BM_SETCHECK, BST_CHECKED, 0);
+      Mk(h, L"BUTTON", L"Изменить список…", WS_TABSTOP, 8 + W - 112, y - 3, 112, 26, IDS_EDITEXCL, 0); y += 40;
+      Mk(h, L"BUTTON", L"Сделать снимок", WS_TABSTOP | BS_DEFPUSHBUTTON, 8 + W - 200, y, 110, 28, IDOK, 0);
+      Mk(h, L"BUTTON", L"Отмена", WS_TABSTOP, 8 + W - 82, y, 82, 28, IDCANCEL, 0);
+      return 0;
+    }
+    case WM_COMMAND: {
+      int id = LOWORD(wp);
+      if (!d) break;
+      if (id == IDS_EDITEXCL) { wchar_t a[MAX_PATH + 8]; _snwprintf(a, MAX_PATH + 7, L"\"%ls\"", g_exclFile); ShellExecuteW(h, L"open", L"notepad.exe", a, NULL, SW_SHOWNORMAL); return 0; }
+      if (id == IDOK) {
+        int len;
+        GetWindowTextW(d->eName, d->name, 200);
+        Trim(d->name);
+        if (!d->name[0]) wcscpy(d->name, L"Снимок");
+        d->useBook = ExpChecked(d->cBook); d->hklm = ExpChecked(d->cHklm); d->hkcu = ExpChecked(d->cHkcu); d->hku = ExpChecked(d->cHku);
+        d->useExcl = ExpChecked(d->cExcl);
+        len = GetWindowTextLengthW(d->eManual);
+        d->manual = (wchar_t *)malloc((len + 2) * sizeof(wchar_t));
+        GetWindowTextW(d->eManual, d->manual, len + 1);
+        d->ok = TRUE; d->done = TRUE;
+        return 0;
+      }
+      if (id == IDCANCEL) { d->done = TRUE; return 0; }
+      break;
+    }
+    case WM_CLOSE: if (d) d->done = TRUE; return 0;
+  }
+  return DefWindowProcW(h, m, wp, lp);
+}
+
+static BOOL RunSnapDlg(SnapDlg *d)
+{
+  RECT r = { 0, 0, 560, 392 }, orc;
+  MSG msg;
+  DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+  int w, hgt, x, y;
+  AdjustWindowRectEx(&r, style, FALSE, WS_EX_DLGMODALFRAME);
+  w = r.right - r.left; hgt = r.bottom - r.top;
+  GetWindowRect(g_hMain, &orc);
+  x = orc.left + ((orc.right - orc.left) - w) / 2; y = orc.top + ((orc.bottom - orc.top) - hgt) / 2;
+  if (x < 0) x = 0;
+  if (y < 0) y = 0;
+  EnableWindow(g_hMain, FALSE);
+  d->hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, CLS_SNAP, L"Новый снимок реестра", style, x, y, w, hgt, g_hMain, NULL, g_hInst, d);
+  if (!d->hwnd) { EnableWindow(g_hMain, TRUE); return FALSE; }
+  ShowWindow(d->hwnd, SW_SHOW);
+  SetForegroundWindow(d->hwnd);
+  while (!d->done) {
+    int rc = GetMessageW(&msg, NULL, 0, 0);
+    if (rc <= 0) { if (rc == 0) PostQuitMessage((int)msg.wParam); break; }
+    if (!IsDialogMessageW(d->hwnd, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+  }
+  EnableWindow(g_hMain, TRUE);
+  DestroyWindow(d->hwnd);
+  SetForegroundWindow(g_hMain);
+  return d->ok;
+}
+
+static void EnsureExclFile(void)
+{
+  static const wchar_t *def =
+    L"# Ветки реестра, которые Windows постоянно меняет сама («шум»). Одна ветка в строке, # - комментарий.\r\n"
+    L"# Исключается ветка целиком, вместе с вложенными. Можно добавлять свои.\r\n"
+    L"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist\r\n"
+    L"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\r\n"
+    L"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU\r\n"
+    L"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedPaths\r\n"
+    L"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ComDlg32\r\n"
+    L"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StreamMRU\r\n"
+    L"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FeatureUsage\r\n"
+    L"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\Shell\\BagMRU\r\n"
+    L"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\Shell\\Bags\r\n"
+    L"HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\ShellNoRoam\r\n"
+    L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Perflib\r\n"
+    L"HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\bam\r\n"
+    L"HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Control\\Session Manager\\AppCompatCache\r\n";
+  if (GetFileAttributesW(g_exclFile) == INVALID_FILE_ATTRIBUTES) WriteUtf8Bom(g_exclFile, def);
+}
+
+static void LoadExclusions(Scope *sc)
+{
+  DWORD len;
+  BYTE *raw;
+  wchar_t *w, *p;
+  EnsureExclFile();
+  raw = ReadAllLimit(g_exclFile, &len, 1u << 20);
+  if (!raw) return;
+  w = Utf8ToWide(raw, len);
+  free(raw);
+  p = w;
+  while (*p) {
+    wchar_t *eol = p, line[2100], norm[2048];
+    size_t l;
+    while (*eol && *eol != L'\n') eol++;
+    l = (size_t)(eol - p);
+    if (l > 2090) l = 2090;
+    wcsncpy(line, p, l); line[l] = 0;
+    Trim(line);
+    if (line[0] && line[0] != L'#' && NormalizeKey(line, norm, 2048)) ScAddExcl(sc, norm);
+    p = *eol ? eol + 1 : eol;
+  }
+  free(w);
+}
+
+static void AddManualRoots(Scope *sc, const wchar_t *text, int *bad)
+{
+  const wchar_t *p = text;
+  while (*p) {
+    const wchar_t *eol = p;
+    wchar_t line[2100], norm[2048];
+    size_t l;
+    while (*eol && *eol != L'\n') eol++;
+    l = (size_t)(eol - p);
+    if (l > 2090) l = 2090;
+    wcsncpy(line, p, l); line[l] = 0;
+    Trim(line);
+    if (line[0]) { if (NormalizeKey(line, norm, 2048)) ScAddRoot(sc, norm); else (*bad)++; }
+    p = *eol ? eol + 1 : eol;
+  }
+}
+
+/* убрать дубли и вложенные корни (остаются самые верхние) */
+static void ScNormalizeRoots(Scope *sc)
+{
+  int i, n = 0;
+  wchar_t **out = (wchar_t **)calloc(sc->nroots + 1, sizeof(wchar_t *));
+  qsort(sc->roots, sc->nroots, sizeof(wchar_t *), QsCmpPath);
+  for (i = 0; i < sc->nroots; i++) {
+    if (n > 0 && IsUnderPath(sc->roots[i], out[n - 1])) { free(sc->roots[i]); continue; }
+    out[n++] = sc->roots[i];
+  }
+  free(sc->roots);
+  sc->roots = out;
+  sc->nroots = n;
+  sc->caproots = n + 1;
+}
+
+static void ActSnapNew(void)
+{
+  TargetList tl;
+  SnapDlg d;
+  ScanJob *sj;
+  int bad = 0;
+  wchar_t ts[32], tsf[32], fname[600], msg[900];
+  memset(&tl, 0, sizeof tl);
+  CollectTargets(&tl);
+  memset(&d, 0, sizeof d);
+  d.nBook = tl.n;
+  if (!RunSnapDlg(&d)) { free(tl.t); free(d.manual); return; }
+  sj = (ScanJob *)calloc(1, sizeof *sj);
+  if (d.useBook) { int i; for (i = 0; i < tl.n; i++) ScAddRoot(&sj->scope, tl.t[i].path); }
+  if (d.hklm) ScAddRoot(&sj->scope, L"HKEY_LOCAL_MACHINE");
+  if (d.hkcu) ScAddRoot(&sj->scope, L"HKEY_CURRENT_USER");
+  if (d.hku) ScAddRoot(&sj->scope, L"HKEY_USERS");
+  AddManualRoots(&sj->scope, d.manual ? d.manual : L"", &bad);
+  free(d.manual);
+  free(tl.t);
+  ScNormalizeRoots(&sj->scope);
+  if (sj->scope.nroots == 0) {
+    MessageBoxW(g_hMain, bad ? L"Не удалось распознать ни одной ветки. Путь должен начинаться с HKEY_... или HKLM/HKCU/HKCR/HKU/HKCC." : L"Не выбрано ни одной ветки для снимка.", APP_NAME, MB_ICONINFORMATION);
+    ScFree(&sj->scope); free(sj);
+    return;
+  }
+  if (d.hklm || d.hkcu || d.hku) {
+    if (MessageBoxW(g_hMain, L"Снимок целого раздела реестра может занять от десятков секунд до нескольких минут и занять много места на диске.\n\nПродолжить?", APP_NAME, MB_YESNO | MB_ICONQUESTION) != IDYES) {
+      ScFree(&sj->scope); free(sj);
+      return;
+    }
+  }
+  if (d.useExcl) LoadExclusions(&sj->scope);
+  wcsncpy(sj->name, d.name, 199);
+  NowStr(ts, 32);
+  MakeTimestamp(tsf, 32);
+  EnsureDir(g_snapDir);
+  MakeRegName(fname, 600, 150, tsf, d.name, L"");
+  _snwprintf(sj->file, MAX_PATH + 15, L"%ls\\%ls.ksn", g_snapDir, fname);
+  UniquePath(sj->file, MAX_PATH + 16);
+  RunBusy(ScanWorker, sj, L"Снимок реестра");
+  if (sj->ok) {
+    _snwprintf(msg, 899, L"Снимок готов: «%ls»\nДата и время: %ls\nВеток: %lu, значений: %lu%ls", sj->name, sj->start, sj->keys, sj->vals,
+               sj->errs ? L"\n\nЧасть веток недоступна для чтения (нужны права администратора или это защищённые ветки). Подробности в логе." : L"");
+    SnapListRefresh();
+    { int i; for (i = 0; i < g_nsnaps; i++) if (_wcsicmp(g_snaps[i].file, sj->file) == 0) { ListView_SetItemState(g_hSnapLV, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED); ListView_EnsureVisible(g_hSnapLV, i, FALSE); } }
+    MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONINFORMATION);
+  } else if (sj->canceled) MessageBoxW(g_hMain, L"Снимок отменён.", APP_NAME, MB_ICONINFORMATION);
+  else MessageBoxW(g_hMain, L"Не удалось создать снимок (см. лог).", APP_NAME, MB_ICONERROR);
+  ScFree(&sj->scope);
+  free(sj);
+}
+
+static void ActSnapCompare(void)
+{
+  int idx[2] = { -1, -1 }, n = 0, i;
+  CmpJob *j;
+  wchar_t when[32], ts[32], rname[700], rp[MAX_PATH + 16], msg[1400], a40[60], b40[60];
+  SnapSelected(idx, &n);
+  if (n < 1 || n > 2) { MessageBoxW(g_hMain, L"Выберите один снимок (сравнить с текущим состоянием) или два (сравнить между собой).", APP_NAME, MB_ICONINFORMATION); return; }
+  j = (CmpJob *)calloc(1, sizeof *j);
+  if (n == 1) {
+    j->vsCurrent = TRUE;
+    wcscpy(j->fileA, g_snaps[idx[0]].file);
+    _snwprintf(j->tmpFile, MAX_PATH + 15, L"%ls\\_current.tmp", g_snapDir);
+    _snwprintf(j->curName, 199, L"Состояние после «%ls»", g_snaps[idx[0]].name);
+    wcscpy(g_cmpB, L"Текущее состояние реестра");
+  } else {
+    int a = idx[0], b = idx[1];
+    if (wcscmp(g_snaps[a].start, g_snaps[b].start) > 0) { int t = a; a = b; b = t; }
+    wcscpy(j->fileA, g_snaps[a].file);
+    wcscpy(j->fileB, g_snaps[b].file);
+  }
+  ListView_SetItemCountEx(g_hDiffLV, 0, 0);
+  FreeDiff();
+  RunBusy(CompareWorker, j, L"Сравнение");
+  if (j->result != 1) {
+    if (j->vsCurrent) DeleteFileW(j->tmpFile);
+    MessageBoxW(g_hMain, j->result == 2 ? L"Сравнение отменено." : (j->err[0] ? j->err : L"Не удалось выполнить сравнение (см. лог)."), APP_NAME, j->result == 2 ? MB_ICONINFORMATION : MB_ICONERROR);
+    free(j);
+    return;
+  }
+  NowStr(when, 32);
+  wcscpy(g_cmpWhen, when);
+  BuildSummary(g_cmpSummary, 900);
+  DiffViewRefresh();
+  /* отчёт автоматически сохраняется в папку Reports */
+  EnsureDir(g_repDir);
+  MakeTimestamp(ts, 32);
+  wcsncpy(a40, g_cmpA, 40); a40[40] = 0; SanitizeName(a40);
+  wcsncpy(b40, g_cmpB, 40); b40[40] = 0; SanitizeName(b40);
+  _snwprintf(rname, 699, L"%ls - %ls vs %ls", ts, a40, b40);
+  {
+    wchar_t nm2[600];
+    MakeRegName(nm2, 600, 150, L"", rname, L"");
+    _snwprintf(rp, MAX_PATH + 15, L"%ls\\%ls.txt", g_repDir, nm2);
+    UniquePath(rp, MAX_PATH + 16);
+  }
+  if (WriteReport(rp)) wcscpy(g_lastReport, rp); else g_lastReport[0] = 0;
+  Log(L"Сравнение: %ls (%ls) -> %ls (%ls): %ls", g_cmpA, g_cmpTimeA, g_cmpB, g_cmpTimeB, g_cmpSummary);
+  SnapRefreshUI();
+  _snwprintf(msg, 1399, L"Сравнение готово (%ls).\n\n%ls\n\nОтчёт сохранён:\n%ls", when, g_cmpSummary, g_lastReport[0] ? g_lastReport : L"(не удалось сохранить)");
+  MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONINFORMATION);
+  if (j->vsCurrent) {
+    if (MessageBoxW(g_hMain, L"Сохранить текущее состояние как новый снимок? Его можно будет сравнивать дальше (например, после следующей установки).", APP_NAME, MB_YESNO | MB_ICONQUESTION) == IDYES) {
+      wchar_t fname[600], tsf[32], dst[MAX_PATH + 16];
+      MakeTimestamp(tsf, 32);
+      MakeRegName(fname, 600, 150, tsf, j->curName, L"");
+      _snwprintf(dst, MAX_PATH + 15, L"%ls\\%ls.ksn", g_snapDir, fname);
+      UniquePath(dst, MAX_PATH + 16);
+      if (!MoveFileW(j->tmpFile, dst)) DeleteFileW(j->tmpFile);
+      SnapListRefresh();
+    } else DeleteFileW(j->tmpFile);
+  }
+  (void)i;
+  free(j);
+}
+
+static void ActSnapDelete(void)
+{
+  int idx[2] = { -1, -1 }, n = 0, i;
+  wchar_t msg[500];
+  SnapSelected(idx, &n);
+  if (n < 1) return;
+  if (n == 1) _snwprintf(msg, 499, L"Удалить снимок «%ls» (%ls)?\nФайл будет удалён без возможности восстановления.", g_snaps[idx[0]].name, g_snaps[idx[0]].start);
+  else wcscpy(msg, L"Удалить выбранные снимки?\nФайлы будут удалены без возможности восстановления.");
+  if (MessageBoxW(g_hMain, msg, APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+  {
+    int sel = -1;
+    wchar_t **files = (wchar_t **)calloc(g_nsnaps + 1, sizeof(wchar_t *));
+    int nf = 0;
+    while ((sel = ListView_GetNextItem(g_hSnapLV, sel, LVNI_SELECTED)) >= 0) files[nf++] = Dup(g_snaps[sel].file);
+    for (i = 0; i < nf; i++) { DeleteFileW(files[i]); free(files[i]); }
+    free(files);
+  }
+  SnapListRefresh();
+}
+
+static void ActSnapOpenReport(void)
+{
+  wchar_t arg[MAX_PATH + 24];
+  if (!g_lastReport[0]) return;
+  _snwprintf(arg, MAX_PATH + 23, L"\"%ls\"", g_lastReport);
+  ShellExecuteW(g_hMain, L"open", L"notepad.exe", arg, NULL, SW_SHOWNORMAL);
+}
+
+static void LvCol(HWND lv, int i, const wchar_t *t, int w)
+{
+  LVCOLUMNW col;
+  memset(&col, 0, sizeof col);
+  col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+  col.pszText = (LPWSTR)t; col.cx = w; col.iSubItem = i;
+  SendMessageW(lv, LVM_INSERTCOLUMNW, i, (LPARAM)&col);
+}
+
+/* режимы командной строки для скриптов и самопроверки:
+ *   /snap файл.ksn "название" ветка [ветка...]   - снимок указанных веток
+ *   /cmp  старый.ksn новый.ksn отчёт.txt         - сравнение двух снимков */
+static int CliSnap(int argc, wchar_t **argv)
+{
+  ScanJob *sj = (ScanJob *)calloc(1, sizeof *sj);
+  int i;
+  wcsncpy(sj->file, argv[2], MAX_PATH + 15);
+  wcsncpy(sj->name, argv[3], 199);
+  for (i = 4; i < argc; i++) { wchar_t norm[2048]; if (NormalizeKey(argv[i], norm, 2048)) ScAddRoot(&sj->scope, norm); }
+  ScNormalizeRoots(&sj->scope);
+  g_cancel = 0;
+  return DoScanToFile(sj) ? 0 : 1;
+}
+
+static int CliCmp(int argc, wchar_t **argv)
+{
+  CmpJob *j = (CmpJob *)calloc(1, sizeof *j);
+  (void)argc;
+  wcsncpy(j->fileA, argv[2], MAX_PATH + 15);
+  wcsncpy(j->fileB, argv[3], MAX_PATH + 15);
+  g_cancel = 0;
+  FreeDiff();
+  CompareWorker(j);
+  if (j->result != 1) return 2;
+  NowStr(g_cmpWhen, 32);
+  BuildSummary(g_cmpSummary, 900);
+  return WriteReport(argv[4]) ? 0 : 3;
+}
+
 /* ---- главное окно ---- */
 static void ApplyOptions(void)
 {
@@ -2423,6 +3758,7 @@ static void ApplyOptions(void)
   CheckMenuItem(m, IDM_OPT_NEWWIN, MF_BYCOMMAND | (g_newWin ? MF_CHECKED : MF_UNCHECKED));
   CheckMenuItem(m, IDM_OPT_ONTOP, MF_BYCOMMAND | (g_onTop ? MF_CHECKED : MF_UNCHECKED));
   CheckMenuItem(m, IDM_OPT_SHELL, MF_BYCOMMAND | (ShellMenuRegistered() ? MF_CHECKED : MF_UNCHECKED));
+  CheckMenuItem(m, IDM_LOGTOGGLE, MF_BYCOMMAND | (g_logOn ? MF_CHECKED : MF_UNCHECKED));
   SendMessageW(g_hChkNew, BM_SETCHECK, g_newWin ? BST_CHECKED : BST_UNCHECKED, 0);
   SetWindowPos(g_hMain, g_onTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
@@ -2441,6 +3777,7 @@ static void SaveSettings(void)
   }
   WritePrivateProfileStringW(L"Options", L"NewWindow", g_newWin ? L"1" : L"0", g_iniFile);
   WritePrivateProfileStringW(L"Options", L"AlwaysOnTop", g_onTop ? L"1" : L"0", g_iniFile);
+  WritePrivateProfileStringW(L"Options", L"LogEnabled", g_logOn ? L"1" : L"0", g_iniFile);
 }
 
 static void Layout(int cw, int ch)
@@ -2475,6 +3812,9 @@ static void Layout(int cw, int ch)
   MoveWindow(g_hBtnX[0], x, y2, bw3, 28, TRUE);
   MoveWindow(g_hBtnX[1], x + bw3 + 8, y2, bw3, 28, TRUE);
   MoveWindow(g_hBtnX[2], x + 2 * (bw3 + 8), y2, bw3, 28, TRUE);
+  MoveWindow(g_hSnapLV, m, treeTop, tw, treeH, TRUE);
+  MoveWindow(g_hSnapInfo, x, m, rw, 76, TRUE);
+  MoveWindow(g_hDiffLV, x, m + 82, rw, y1 - 6 - (m + 82), TRUE);
 }
 
 static void ShowTreeMenu(void)
@@ -2601,7 +3941,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
       HIMAGELIST il;
       SHFILEINFOW sfi;
       wchar_t win[MAX_PATH], rg[MAX_PATH];
-      HWND *all[] = { &g_hTree, &g_hName, &g_hPath, &g_hComment, &g_hBtnJump, &g_hBtnJumpNew, &g_hChkNew, &g_hTab, &g_hSaved, &g_hCount, &g_hBtnX[0], &g_hBtnX[1], &g_hBtnX[2] };
+      HWND *all[] = { &g_hTree, &g_hName, &g_hPath, &g_hComment, &g_hBtnJump, &g_hBtnJumpNew, &g_hChkNew, &g_hTab, &g_hSaved, &g_hCount, &g_hBtnX[0], &g_hBtnX[1], &g_hBtnX[2], &g_hSnapLV, &g_hDiffLV, &g_hSnapInfo };
       size_t i;
       g_hMain = h;
       g_hTree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES |
@@ -2627,11 +3967,20 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         TabCtrl_InsertItem(g_hTab, 0, &ti);
         ti.pszText = (LPWSTR)L"Сохранённые";
         TabCtrl_InsertItem(g_hTab, 1, &ti);
+        ti.pszText = (LPWSTR)L"Сравнение";
+        TabCtrl_InsertItem(g_hTab, 2, &ti);
         g_hSaved = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"", WS_CHILD | WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES |
                                    TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_EDITLABELS, 0, 0, 10, 10, h, (HMENU)IDC_SAVED, g_hInst, NULL);
         g_hCount = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 0, 0, 10, 10, h, (HMENU)IDC_COUNT, g_hInst, NULL);
         for (k = 0; k < 3; k++)
           g_hBtnX[k] = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 10, h, (HMENU)(INT_PTR)(IDC_X1 + k), g_hInst, NULL);
+        g_hSnapLV = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, 0, 0, 10, 10, h, (HMENU)IDC_SNAPLV, g_hInst, NULL);
+        ListView_SetExtendedListViewStyle(g_hSnapLV, LVS_EX_FULLROWSELECT);
+        LvCol(g_hSnapLV, 0, L"Дата и время", 118); LvCol(g_hSnapLV, 1, L"Название", 120); LvCol(g_hSnapLV, 2, L"Веток", 52); LvCol(g_hSnapLV, 3, L"Значений", 62);
+        g_hDiffLV = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_OWNERDATA, 0, 0, 10, 10, h, (HMENU)IDC_DIFFLV, g_hInst, NULL);
+        ListView_SetExtendedListViewStyle(g_hDiffLV, LVS_EX_FULLROWSELECT);
+        LvCol(g_hDiffLV, 0, L"Что", 120); LvCol(g_hDiffLV, 1, L"Ветка", 280); LvCol(g_hDiffLV, 2, L"Значение", 110); LvCol(g_hDiffLV, 3, L"Было", 190); LvCol(g_hDiffLV, 4, L"Стало", 190);
+        g_hSnapInfo = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT, 0, 0, 10, 10, h, (HMENU)IDC_SNAPINFO, g_hInst, NULL);
       }
       for (i = 0; i < sizeof all / sizeof all[0]; i++) DlgSetFont(*all[i]);
       for (i = 0; i < 3; i++) DlgSetFont(g_hLbl[i]);
@@ -2680,8 +4029,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
       }
       switch (id) {
         case IDOK: if (GetFocus() == g_hTree) ActJump(FALSE); else if (GetFocus() == g_hSaved) SavedJump(FALSE); break;
-        case IDC_JUMP: case IDM_JUMP: if (g_tab == 0) ActJump(FALSE); else SavedJump(FALSE); break;
-        case IDC_JUMPNEW: case IDM_JUMPNEW: if (g_tab == 0) ActJump(TRUE); else SavedJump(TRUE); break;
+        case IDC_JUMP: case IDM_JUMP:
+          if (g_tab == 0) ActJump(FALSE); else if (g_tab == 1) SavedJump(FALSE); else if (id == IDC_JUMP) ActSnapNew();
+          break;
+        case IDC_JUMPNEW: case IDM_JUMPNEW:
+          if (g_tab == 0) ActJump(TRUE); else if (g_tab == 1) SavedJump(TRUE); else if (id == IDC_JUMPNEW) ActSnapCompare();
+          break;
         case IDC_NEWWIN:
           g_newWin = SendMessageW(g_hChkNew, BM_GETCHECK, 0, 0) == BST_CHECKED;
           ApplyOptions();
@@ -2713,12 +4066,26 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         case IDM_REFRESH: SavedRefresh(NULL); break;
         case IDM_OPENARCH: CreateDirectoryW(g_savedDir, NULL); ShellExecuteW(h, L"open", g_savedDir, NULL, NULL, SW_SHOWNORMAL); break;
         case IDM_NOTEPAD: SavedNotepad(); break;
+        case IDM_SNAPNEW: ActSnapNew(); SwitchTab(2); break;
+        case IDM_SNAPCMP: if (g_tab != 2) SwitchTab(2); else ActSnapCompare(); break;
+        case IDM_SNAPDEL: if (g_tab != 2) SwitchTab(2); else ActSnapDelete(); break;
+        case IDM_SNAPEXCL: {
+          wchar_t a[MAX_PATH + 8];
+          EnsureExclFile();
+          _snwprintf(a, MAX_PATH + 7, L"\"%ls\"", g_exclFile);
+          ShellExecuteW(h, L"open", L"notepad.exe", a, NULL, SW_SHOWNORMAL);
+          break;
+        }
+        case IDM_SNAPDIR: CreateDirectoryW(g_snapDir, NULL); ShellExecuteW(h, L"open", g_snapDir, NULL, NULL, SW_SHOWNORMAL); break;
+        case IDM_REPDIR: CreateDirectoryW(g_repDir, NULL); ShellExecuteW(h, L"open", g_repDir, NULL, NULL, SW_SHOWNORMAL); break;
+        case IDM_REPOPEN: ActSnapOpenReport(); break;
+        case IDM_LOGTOGGLE: g_logOn = !g_logOn; ApplyOptions(); break;
         case IDM_SHOWFILE: SavedShow(); break;
         case IDM_RESTORE: SavedRestore(); break;
-        case IDC_X1: PostMessageW(h, WM_COMMAND, g_tab == 0 ? IDM_SAVE : IDM_NOTEPAD, 0); break;
-        case IDC_X2: PostMessageW(h, WM_COMMAND, g_tab == 0 ? IDM_EXPBAT : IDM_SHOWFILE, 0); break;
+        case IDC_X1: PostMessageW(h, WM_COMMAND, g_tab == 0 ? IDM_SAVE : g_tab == 1 ? IDM_NOTEPAD : IDM_REPOPEN, 0); break;
+        case IDC_X2: PostMessageW(h, WM_COMMAND, g_tab == 0 ? IDM_EXPBAT : g_tab == 1 ? IDM_SHOWFILE : IDM_SNAPDIR, 0); break;
         case IDC_X3:
-          if (g_tab == 0) OpenRegedit(g_newWin); else SavedRestore();
+          if (g_tab == 0) OpenRegedit(g_newWin); else if (g_tab == 1) SavedRestore(); else ActSnapDelete();
           break;
         case IDM_IMPORT: ActImport(); break;
         case IDM_EXPORT: ActExport(); break;
@@ -2738,6 +4105,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_NOTIFY: {
       NMHDR *nh = (NMHDR *)lp;
       if (nh->hwndFrom == g_hTab) { if (nh->code == TCN_SELCHANGE) SwitchTab(TabCtrl_GetCurSel(g_hTab)); return 0; }
+      if (nh->hwndFrom == g_hSnapLV) return SnapLvNotify(nh, lp);
+      if (nh->hwndFrom == g_hDiffLV) return DiffLvNotify(nh, lp);
       if (nh->hwndFrom == g_hSaved) return SavedNotify(nh, lp);
       if (nh->hwndFrom != g_hTree) break;
       switch (nh->code) {
@@ -3005,8 +4374,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
   }
   InitializeCriticalSection(&g_cs);
   OleInitialize(NULL);
+  _snwprintf(g_snapDir, MAX_PATH - 1, L"%ls\\Snapshots", g_dataDir);
+  _snwprintf(g_repDir, MAX_PATH - 1, L"%ls\\Reports", g_dataDir);
+  _snwprintf(g_exclFile, MAX_PATH - 1, L"%ls\\snapshot_exclude.txt", g_dataDir);
 
   argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (argv && argc >= 5 && !_wcsicmp(argv[1], L"/snap")) return CliSnap(argc, argv);
+  if (argv && argc >= 5 && !_wcsicmp(argv[1], L"/cmp")) return CliCmp(argc, argv);
   mtx = CreateMutexW(NULL, FALSE, MUTEX_NAME);
   already = (GetLastError() == ERROR_ALREADY_EXISTS);
   if (already) {
@@ -3035,6 +4409,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
   g_jumpMutex = CreateMutexW(NULL, FALSE, NULL);
   g_newWin = GetPrivateProfileIntW(L"Options", L"NewWindow", 1, g_iniFile) != 0;
   g_onTop = GetPrivateProfileIntW(L"Options", L"AlwaysOnTop", 0, g_iniFile) != 0;
+  g_logOn = GetPrivateProfileIntW(L"Options", L"LogEnabled", 1, g_iniFile) != 0;
 
   icc.dwSize = sizeof icc;
   icc.dwICC = ICC_TREEVIEW_CLASSES | ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_PROGRESS_CLASS;
@@ -3064,6 +4439,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
   wc.lpfnWndProc = BusyProc;
   wc.lpszClassName = CLS_BUSY;
   RegisterClassExW(&wc);
+  wc.lpfnWndProc = SnapProc;
+  wc.lpszClassName = CLS_SNAP;
+  RegisterClassExW(&wc);
 
   mb = CreateMenu(); mf = CreatePopupMenu(); ms = CreatePopupMenu(); mh = CreatePopupMenu();
   AppendMenuW(mf, MF_STRING, IDM_NEWKEY, L"Добавить &ветку\tCtrl+N");
@@ -3081,7 +4459,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
   AppendMenuW(ms, MF_STRING, IDM_OPT_NEWWIN, L"Открывать в отдельном окне regedit (/m)");
   AppendMenuW(ms, MF_STRING, IDM_OPT_ONTOP, L"Поверх всех окон");
   AppendMenuW(ms, MF_SEPARATOR, 0, NULL);
-  AppendMenuW(ms, MF_STRING, IDM_OPT_SHELL, L"Пункт «Добавить в KeyShelf» в меню .reg-файлов");
+  AppendMenuW(ms, MF_STRING, IDM_OPT_SHELL, L"Пункт «Добавить в Key Shelf Reg Jumper» в меню .reg-файлов");
+  AppendMenuW(ms, MF_STRING, IDM_LOGTOGGLE, L"Вести лог (keyshelf.log)");
   AppendMenuW(mh, MF_STRING, IDM_ABOUT, L"&О программе");
   AppendMenuW(mb, MF_POPUP, (UINT_PTR)mf, L"&Файл");
   {
@@ -3102,6 +4481,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
     AppendMenuW(ma, MF_STRING, IDM_OPENARCH, L"Открыть папку архива в Проводнике");
     AppendMenuW(mb, MF_POPUP, (UINT_PTR)ma, L"&Архив");
   }
+  {
+    HMENU mn = CreatePopupMenu();
+    AppendMenuW(mn, MF_STRING, IDM_SNAPNEW, L"Сделать снимок реестра...");
+    AppendMenuW(mn, MF_STRING, IDM_SNAPCMP, L"Сравнить выбранный снимок");
+    AppendMenuW(mn, MF_STRING, IDM_SNAPDEL, L"Удалить снимок");
+    AppendMenuW(mn, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(mn, MF_STRING, IDM_SNAPEXCL, L"Изменить список исключений (шум)...");
+    AppendMenuW(mn, MF_STRING, IDM_SNAPDIR, L"Открыть папку снимков");
+    AppendMenuW(mn, MF_STRING, IDM_REPDIR, L"Открыть папку отчётов");
+    AppendMenuW(mb, MF_POPUP, (UINT_PTR)mn, L"С&равнение");
+  }
   AppendMenuW(mb, MF_POPUP, (UINT_PTR)ms, L"&Настройки");
   AppendMenuW(mb, MF_POPUP, (UINT_PTR)mh, L"&Справка");
 
@@ -3115,7 +4505,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
   vs.right = vs.left + GetSystemMetrics(SM_CXVIRTUALSCREEN); vs.bottom = vs.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
   if (x != CW_USEDEFAULT && (x < vs.left - 50 || x > vs.right - 100 || y < vs.top - 10 || y > vs.bottom - 100)) x = y = CW_USEDEFAULT;
 
-  g_hMain = CreateWindowExW(0, CLS_MAIN, L"KeyShelf — закладки веток реестра", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+  g_hMain = CreateWindowExW(0, CLS_MAIN, L"Key Shelf Reg Jumper — закладки веток реестра", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                             x, y, w, hgt, NULL, mb, hInst, NULL);
   if (!g_hMain) { Log(L"ОШИБКА: не создано окно (%lu)", GetLastError()); return 1; }
 
@@ -3124,6 +4514,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
   g_dirty = FALSE;
   ShowNode(NULL);
   SavedRefresh(NULL);
+  SnapListRefresh();
   SwitchTab(0);
   if (ShellMenuRegistered()) SetShellMenu(TRUE); /* обновить путь к exe, если файл переместили */
   DragAcceptFiles(g_hMain, TRUE);

@@ -26,10 +26,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: KeyShelf
+          name: KeyShelfRegJumper
           path: |
-            KeyShelf_x64.exe
-            KeyShelf_x86.exe
+            KeyShelfRegJumper_x64.exe
+            KeyShelfRegJumper_x86.exe
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -42,18 +42,18 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: KeyShelf
+          name: KeyShelfRegJumper
 
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sha256sum KeyShelf_x64.exe KeyShelf_x86.exe > SHA256SUMS.txt
+          sha256sum KeyShelfRegJumper_x64.exe KeyShelfRegJumper_x86.exe > SHA256SUMS.txt
           NOTES="docs/release-notes/${GITHUB_REF_NAME}.md"
           if [ -f "$NOTES" ]; then
-            gh release create "$GITHUB_REF_NAME" KeyShelf_x64.exe KeyShelf_x86.exe SHA256SUMS.txt \
-              --title "KeyShelf ${GITHUB_REF_NAME}" --notes-file "$NOTES"
+            gh release create "$GITHUB_REF_NAME" KeyShelfRegJumper_x64.exe KeyShelfRegJumper_x86.exe SHA256SUMS.txt \
+              --title "Key Shelf Reg Jumper ${GITHUB_REF_NAME}" --notes-file "$NOTES"
           else
-            gh release create "$GITHUB_REF_NAME" KeyShelf_x64.exe KeyShelf_x86.exe SHA256SUMS.txt \
-              --title "KeyShelf ${GITHUB_REF_NAME}" --generate-notes
+            gh release create "$GITHUB_REF_NAME" KeyShelfRegJumper_x64.exe KeyShelfRegJumper_x86.exe SHA256SUMS.txt \
+              --title "Key Shelf Reg Jumper ${GITHUB_REF_NAME}" --generate-notes
           fi
