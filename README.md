@@ -4,7 +4,7 @@
 
 Небольшая портативная программа для Windows 7–10: закладки на ветки реестра с папками и комментариями,
 быстрый переход в `regedit`, сохранение веток в `.reg` с историей, экспорт в `.bat` и **сравнение состояния
-реестра «до / после»** (например, до и после установки программы). Один exe-файл, без установки и без внешних
+реестра «до / после»** (например, до и после установки программы) и **наблюдение за изменениями онлайн**. Один exe-файл, без установки и без внешних
 библиотек (чистый Win32 API, C).
 
 ![screenshot](docs/screenshot.png)
@@ -30,6 +30,16 @@
   изменённые значения с блоками «было / стало». Снимки хранятся на диске (папка `Snapshots`) с датой и временем,
   переживают перезагрузку, сравнивать можно любые два снимка. Текстовый отчёт сохраняется в папку `Reports`.
   «Шумные» ветки, которые Windows меняет сама, исключаются по списку `snapshot_exclude.txt` (его можно править).
+- **Наблюдение онлайн (вкладка «Наблюдение»).** Выбираете ветки (из закладок, целые разделы или свои), и каждое
+  изменение (добавлено, удалено, изменено, с блоками «было / стало») появляется в списке и записывается в лог
+  наблюдения (папка `Watch`). Windows сообщает, что в ветке что-то изменилось, но не называет процесс, поэтому
+  программа пересчитывает ветку и показывает разницу.
+- **Взять ветку из открытого regedit** (`Ctrl+G`): открываете regedit, переходите на нужную ветку, и программа
+  берёт её путь и предлагает: в закладки, сохранить в `.reg`, в снимок для сравнения, экспорт в `.bat` или в наблюдение.
+  Если прочитать окно regedit не удаётся (например, он запущен от администратора), работает запасной путь: в regedit
+  «Копировать имя раздела», затем та же команда.
+- **Единый файл настроек и закладок** `keyshelf.cfg` (раньше были `keyshelf.ini` и `keyshelf.ksl`; при первом запуске
+  новой версии они переносятся автоматически, старые файлы остаются как `.bak`).
 - **Лог** (`keyshelf.log`) можно отключить в «Настройки».
 
 ## Скачать
@@ -55,20 +65,24 @@ sudo apt install gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 binutils-mingw-w64
 ```
 KeyShelfRegJumper.exe /snap снимок.ksn "название" ветка [ветка ...]   # снимок указанных веток
 KeyShelfRegJumper.exe /cmp старый.ksn новый.ksn отчёт.txt            # сравнить два снимка
+KeyShelfRegJumper.exe /watch секунд ветка [ветка ...]                 # наблюдать N секунд, события в Watch\*.log
 ```
 
 ## Где хранятся данные
 
-Рядом с exe: `keyshelf.ksl` (закладки), `keyshelf.ini` (настройки), `keyshelf.log` (лог), `snapshot_exclude.txt`,
-папки `Saved`, `Bat`, `Snapshots`, `Reports`. Если папка программы недоступна для записи — в `%APPDATA%\KeyShelf`.
+Рядом с exe: `keyshelf.cfg` (настройки и закладки), `keyshelf.log` (лог), `snapshot_exclude.txt` (список исключений для
+сравнения), папки `Saved`, `Bat`, `Snapshots`, `Reports`, `Watch`. Если папка программы недоступна для записи — в `%APPDATA%\KeyShelf`.
 
 ## Ограничения и состояние проекта
 
-- Версия 0.3. Разработка велась кросс-компиляцией под Linux, интерфейс и движок сравнения проверялись в Wine;
+- Версия 0.4. Разработка велась кросс-компиляцией под Linux, интерфейс и движок сравнения проверялись в Wine;
   на реальных Windows 7–10 проверено ограниченно, возможны ошибки.
 - Часть веток (например, `SAM`, `SECURITY`) недоступна для чтения даже администратору: такие ветки пропускаются.
 - Снимок целого раздела может занять от десятков секунд до нескольких минут и много места на диске.
-- Сравнение показывает **что** изменилось, но не **какой процесс** это сделал.
+- Сравнение и наблюдение показывают **что** изменилось, но не **какой процесс** это сделал.
+- Наблюдение за целым разделом реестра создаёт заметную нагрузку (при каждом изменении пересчитывается часть раздела);
+  для точечного слежения выбирайте конкретные ветки.
+- Чтение ветки из окна открытого regedit проверено только в ограниченном виде; если не сработало, используйте «Копировать имя раздела».
 - Сообщения об ошибках приветствуются (приложите последние строки `keyshelf.log`).
 
 ## Лицензия
@@ -91,9 +105,9 @@ and a text report is saved to `Reports`. Noisy keys are excluded via an editable
 
 **Other features:** nested bookmark folders with comments, drag & drop, jump to key (same or new window), add keys
 from `.reg` files, save keys through `reg export` into an archive, group save via checkboxes, `.bat` export
-(`NO-…` normal / `NW-…` new window), switchable log.
+(`NO-…` normal / `NW-…` new window), switchable log, **live registry watching** (changes with "was / now" shown in a list and written to a log), **"take the current key from an open regedit"** (`Ctrl+G`, with a clipboard fallback), and a **single config file** `keyshelf.cfg` (old `.ini` + `.ksl` are migrated automatically).
 
 **Download:** see [Releases](../../releases) (`KeyShelfRegJumper_x64.exe`, `KeyShelfRegJumper_x86.exe`; unsigned,
 SmartScreen/antivirus may warn). **Build:** `./build.sh` with mingw-w64, or GitHub Actions on every push / tag.
-**Status:** v0.3, tested mostly under Wine; limited testing on real Windows. It shows *what* changed, not *which
+**Status:** v0.4, tested mostly under Wine; limited testing on real Windows. It shows *what* changed, not *which
 process* changed it. Licensed under MIT.
