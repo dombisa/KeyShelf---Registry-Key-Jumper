@@ -32,7 +32,8 @@ static BOOL CfgSet(const wchar_t *sec, const wchar_t *key, const wchar_t *val);
 #define WritePrivateProfileStringW(s, k, v, f) CfgSet((s), (k), (v))
 
 #define APP_NAME   L"Key Shelf Reg Jumper"
-#define APP_VER    L"0.4"
+#define APP_VER_STR L"0.5"
+#define APP_VER    APP_VER_STR
 #define CLS_MAIN   L"KeyShelfMainWnd"
 #define CLS_DLG    L"KeyShelfRegDlg"
 #define MUTEX_NAME L"KeyShelf_SingleInstance_Mutex"
@@ -64,10 +65,14 @@ enum {
 };
 enum {
   IDC_WATCHLV = 130, IDC_WATCHINFO,
-  IDM_TAKE = 290, IDM_WSTART, IDM_WSTOP, IDM_WCLEAR, IDM_WLOG, IDM_WDIR
+  IDM_TAKE = 290, IDM_WSTART, IDM_WSTOP, IDM_WCLEAR, IDM_WLOG, IDM_WDIR,
+  IDM_EDIT_DEF = 310, IDM_EDIT_NP, IDM_EDIT_OTHER, IDM_OPT_CLEARTMP, IDM_OPT_PAUTO,
+  IDM_PADD = 320, IDM_PDEL, IDM_PSTART, IDM_PLOG,
+  IDC_PROTLV = 140, IDC_PROTLOG, IDE_FBAT = 420, IDE_FVBS
 };
 #define CLS_PICK L"KeyShelfPickDlg"
 #define WM_APP_WATCH (WM_APP + 6)
+#define WM_APP_PROT  (WM_APP + 7)
 #define CLS_SNAP L"KeyShelfSnapDlg"
 #define WM_APP_QUEUE    (WM_APP + 2)
 #define WM_APP_JUMPFAIL (WM_APP + 3)
@@ -94,10 +99,15 @@ static HWND g_hTab, g_hSaved, g_hCount, g_hBtnX[3];
 static int g_tab, g_imgReg;
 static wchar_t g_savedDir[MAX_PATH], g_batDir[MAX_PATH], g_pendingSelect[MAX_PATH + 8];
 static HTREEITEM g_curS, g_dragS;
-static HWND g_hSnapLV, g_hDiffLV, g_hSnapInfo, g_hWatchInfo, g_hWatchLV;
+static HWND g_hSnapLV, g_hDiffLV, g_hSnapInfo, g_hWatchInfo, g_hWatchLV, g_hProtLV, g_hProtLog;
+static BOOL g_clearTmp = TRUE, g_conProgress;
+static int g_jumpRc;
+static wchar_t g_tmpDir[MAX_PATH];
+static void ConProgressHook(const wchar_t *t);
 static wchar_t g_extraTarget[2048];
 static CRITICAL_SECTION g_mergeCs, g_wcs;
 static void WatchRefreshUI(void);
+static void ProtRefreshUI(void);
 static BOOL g_logOn = TRUE;
 static void SnapRefreshUI(void);
 static BOOL g_dragSaved;
@@ -584,7 +594,7 @@ static void LoadConfig(void)
   g_cfgBook = book.p;
 }
 
-static BOOL SaveConfig(void)
+static BOOL SaveConfigWith(const wchar_t *bookRaw, BOOL writeBook)
 {
   WBuf b = { 0 };
   int i, j;
@@ -606,11 +616,27 @@ static BOOL SaveConfig(void)
       wb_adds(&b, L"\r\n");
     }
   }
-  wb_adds(&b, L"\r\n[Bookmarks]\r\n");
-  SaveRec(&b, TVI_ROOT, 0);
+  if (writeBook) {
+    wb_adds(&b, L"\r\n[Bookmarks]\r\n");
+    if (bookRaw) { const wchar_t *q; for (q = bookRaw; *q; q++) { if (*q == L'\r') continue; if (*q == L'\n') wb_adds(&b, L"\r\n"); else wb_addc(&b, *q); } }
+    else SaveRec(&b, TVI_ROOT, 0);
+  }
   ok = WriteUtf8Atomic(g_cfgFile, b.p);
   free(b.p);
   return ok;
+}
+
+static BOOL SaveConfig(void) { return SaveConfigWith(NULL, TRUE); }
+
+/* удалить целиком раздел настроек */
+static void CfgDeleteSection(const wchar_t *sec)
+{
+  int i, n = 0;
+  for (i = 0; i < g_ncfg; i++) {
+    if (!_wcsicmp(g_cfgItems[i].sec, sec)) { free(g_cfgItems[i].sec); free(g_cfgItems[i].key); free(g_cfgItems[i].val); }
+    else g_cfgItems[n++] = g_cfgItems[i];
+  }
+  g_ncfg = n;
 }
 
 static void SaveAll(void)
@@ -759,6 +785,7 @@ static DWORD WINAPI JumpThread(LPVOID param)
   int n0, i;
   BOOL newWin = r->newWin;
   HINSTANCE h;
+  g_jumpRc = 0;
   WaitForSingleObject(g_jumpMutex, INFINITE);
   GetWindowsDirectoryW(regedit, MAX_PATH);
   wcscat(regedit, L"\\regedit.exe");
@@ -772,11 +799,13 @@ static DWORD WINAPI JumpThread(LPVOID param)
   }
   if (!WriteLastKey(r->path)) {
     Log(L"ОШИБКА: не удалось записать LastKey");
+    g_jumpRc = 1;
     PostMessageW(g_hMain, WM_APP_JUMPFAIL, 1, 0);
   } else {
     h = ShellExecuteW(NULL, L"open", regedit, newWin ? L"/m" : NULL, NULL, SW_SHOWNORMAL);
     if ((INT_PTR)h <= 32) {
       Log(L"ОШИБКА ShellExecute: код %d", (int)(INT_PTR)h);
+      g_jumpRc = 2;
       PostMessageW(g_hMain, WM_APP_JUMPFAIL, 2, (LPARAM)(INT_PTR)h);
     } else {
       for (i = 0; i < 150; i++) { Sleep(100); if (CountRegedit() > n0) break; }
@@ -1528,6 +1557,28 @@ static wchar_t *BuildBat(const wchar_t *keyPath, BOOL newWin)
   return b.p;
 }
 
+/* VBScript: открыть regedit на ветке (аналог bat, для тех, кто предпочитает .vbs) */
+static wchar_t *BuildVbs(const wchar_t *keyPath, BOOL newWin)
+{
+  WBuf b = { 0 };
+  wchar_t root[128], full[4300];
+  const wchar_t *s;
+  GetRootName(root, 128);
+  _snwprintf(full, 4299, L"%ls\\%ls", root, keyPath);
+  full[4299] = 0;
+  wb_adds(&b, L"' Key Shelf Reg Jumper: открыть regedit на нужной ветке реестра\r\n");
+  wb_adds(&b, L"Option Explicit\r\nDim sh, sa, re\r\nSet sh = CreateObject(\"WScript.Shell\")\r\nre = sh.ExpandEnvironmentStrings(\"%windir%\") & \"\\regedit.exe\"\r\n");
+  if (!newWin) {
+    wb_adds(&b, L"' Обычный режим: закрыть уже открытый regedit, иначе он проигнорирует ветку\r\n");
+    wb_adds(&b, L"sh.Run \"taskkill /im regedit.exe\", 0, True\r\nWScript.Sleep 1000\r\n");
+  }
+  wb_adds(&b, L"sh.RegWrite \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Applets\\Regedit\\LastKey\", \"");
+  for (s = full; *s; s++) { if (*s == L'"') wb_addc(&b, L'"'); wb_addc(&b, *s); }
+  wb_adds(&b, L"\", \"REG_SZ\"\r\nSet sa = CreateObject(\"Shell.Application\")\r\n");
+  wb_adds(&b, newWin ? L"sa.ShellExecute re, \"/m\", \"\", \"open\", 1\r\n" : L"sa.ShellExecute re, \"\", \"\", \"open\", 1\r\n");
+  return b.p;
+}
+
 static BOOL WriteUtf8File(const wchar_t *file, const wchar_t *text)
 {
   int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL);
@@ -1642,6 +1693,7 @@ static void SetBusy(const wchar_t *fmt, ...)
   va_end(ap);
   g_busyText[499] = 0;
   LeaveCriticalSection(&g_cs);
+  if (g_conProgress) ConProgressHook(g_busyText);
 }
 
 static LRESULT CALLBACK BusyProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
@@ -1716,7 +1768,7 @@ static BOOL Is64OS(void)
 }
 
 /* возвращает код выхода reg.exe (0 - успех) или -1, если запустить не удалось */
-static int RunRegExport(const wchar_t *key, const wchar_t *outFile, wchar_t *msg, size_t mcap)
+static int RunRegCmd(const wchar_t *tail, wchar_t *msg, size_t mcap)
 {
   wchar_t sysdir[MAX_PATH], cmd[5000], wb[2100];
   SECURITY_ATTRIBUTES sa;
@@ -1729,7 +1781,7 @@ static int RunRegExport(const wchar_t *key, const wchar_t *outFile, wchar_t *msg
   int n;
   msg[0] = 0;
   GetSystemDirectoryW(sysdir, MAX_PATH);
-  _snwprintf(cmd, 4999, L"\"%ls\\reg.exe\" export \"%ls\" \"%ls\" /y%ls", sysdir, key, outFile, Is64OS() ? L" /reg:64" : L"");
+  _snwprintf(cmd, 4999, L"\"%ls\\reg.exe\" %ls", sysdir, tail);
   cmd[4999] = 0;
   memset(&sa, 0, sizeof sa);
   sa.nLength = sizeof sa; sa.bInheritHandle = TRUE;
@@ -1762,8 +1814,24 @@ static int RunRegExport(const wchar_t *key, const wchar_t *outFile, wchar_t *msg
   for (i = 0; wb[i]; i++) if (wb[i] == L'\r' || wb[i] == L'\n') wb[i] = L' ';
   Trim(wb);
   wcsncpy(msg, wb, mcap - 1); msg[mcap - 1] = 0;
-  if (code != 0) Log(L"reg export код %lu: %ls | %ls", code, key, wb);
+  if (code != 0) Log(L"reg код %lu: %ls | %ls", code, tail, wb);
   return (int)code;
+}
+
+static int RunRegExport(const wchar_t *key, const wchar_t *outFile, wchar_t *msg, size_t mcap)
+{
+  wchar_t tail[4600];
+  _snwprintf(tail, 4599, L"export \"%ls\" \"%ls\" /y%ls", key, outFile, Is64OS() ? L" /reg:64" : L"");
+  tail[4599] = 0;
+  return RunRegCmd(tail, msg, mcap);
+}
+
+static int RunRegImport(const wchar_t *file, wchar_t *msg, size_t mcap)
+{
+  wchar_t tail[4600];
+  _snwprintf(tail, 4599, L"import \"%ls\"%ls", file, Is64OS() ? L" /reg:64" : L"");
+  tail[4599] = 0;
+  return RunRegCmd(tail, msg, mcap);
 }
 
 /* добавляет в буфер тело экспортированного .reg без заголовка */
@@ -1862,6 +1930,8 @@ typedef struct {
   BOOL useDate, useTag, combine, toArchive;
   wchar_t destDir[MAX_PATH];
   int batMode;               /* 0 NO, 1 NW, 2 оба */
+  HWND cFBat, cFVbs;
+  BOOL fBat, fVbs;
 } ExpDlg;
 
 static void AddDirsCombo(ExpDlg *d, const wchar_t *dir, int depth)
@@ -1913,6 +1983,7 @@ static void ExpUpdate(ExpDlg *d)
     wchar_t n1[400], n2[400];
     MakeBatName(n1, 400, 150, FALSE, d->firstKey);
     MakeBatName(n2, 400, 150, TRUE, d->firstKey);
+    if (d->cFVbs && ExpChecked(d->cFVbs) && !ExpChecked(d->cFBat)) { wcscpy(n1 + wcslen(n1) - 4, L".vbs"); wcscpy(n2 + wcslen(n2) - 4, L".vbs"); }
     if (ExpChecked(d->rNO)) wcscpy(disp, n1);
     else if (ExpChecked(d->rNW)) wcscpy(disp, n2);
     else _snwprintf(disp, 1499, L"%ls\r\n%ls", n1, n2);
@@ -1975,6 +2046,9 @@ static LRESULT CALLBACK ExpProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         d->rNW = Mk(h, L"BUTTON", L"NW — открыть regedit в новом окне (/m)", BS_AUTORADIOBUTTON, 8, y, W, 20, IDE_NW, 0); y += 22;
         d->rBoth = Mk(h, L"BUTTON", L"Оба варианта (два файла на каждую ветку)", BS_AUTORADIOBUTTON, 8, y, W, 20, IDE_BOTH, 0); y += 28;
         SendMessageW(d->rNW, BM_SETCHECK, BST_CHECKED, 0);
+        d->cFBat = Mk(h, L"BUTTON", L"Скрипт .bat (пакетный файл)", WS_TABSTOP | BS_AUTOCHECKBOX, 8, y, 270, 20, IDE_FBAT, 0);
+        d->cFVbs = Mk(h, L"BUTTON", L"Скрипт .vbs (VBScript)", WS_TABSTOP | BS_AUTOCHECKBOX, 290, y, 270, 20, IDE_FVBS, 0); y += 28;
+        SendMessageW(d->cFBat, BM_SETCHECK, BST_CHECKED, 0);
         Mk(h, L"STATIC", L"Имя файла (пример):", 0, 8, y, W, 16, 92, 0); y += 18;
         d->ePrev = Mk(h, L"EDIT", L"", ES_MULTILINE | ES_READONLY, 8, y, W, 40, IDE_PREVIEW, WS_EX_CLIENTEDGE); y += 50;
         Mk(h, L"STATIC", L"Папка для скриптов:", 0, 8, y, W, 16, 93, 0); y += 18;
@@ -1992,7 +2066,7 @@ static LRESULT CALLBACK ExpProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
       if (!d) break;
       if (id == IDE_NOTE && code == EN_CHANGE) { ExpUpdate(d); return 0; }
       if ((id == IDE_DATE || id == IDE_TAG || id == IDE_SEP || id == IDE_ONE || id == IDE_ARCH || id == IDE_OTHER ||
-           id == IDE_NO || id == IDE_NW || id == IDE_BOTH) && code == BN_CLICKED) { ExpUpdate(d); return 0; }
+           id == IDE_NO || id == IDE_NW || id == IDE_BOTH || id == IDE_FBAT || id == IDE_FVBS) && code == BN_CLICKED) { ExpUpdate(d); return 0; }
       if (id == IDE_BROWSE) {
         wchar_t p[MAX_PATH];
         if (BrowseFolder(h, L"Выберите папку", p)) { SetWindowTextW(d->eDir, p); if (d->kind == 0) { SendMessageW(d->rOther, BM_SETCHECK, BST_CHECKED, 0); SendMessageW(d->rArch, BM_SETCHECK, BST_UNCHECKED, 0); ExpUpdate(d); } }
@@ -2022,6 +2096,8 @@ static LRESULT CALLBACK ExpProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
           }
         } else {
           d->batMode = ExpChecked(d->rNO) ? 0 : ExpChecked(d->rNW) ? 1 : 2;
+          d->fBat = ExpChecked(d->cFBat); d->fVbs = ExpChecked(d->cFVbs);
+          if (!d->fBat && !d->fVbs) { MessageBoxW(h, L"Выберите хотя бы один формат: .bat или .vbs.", APP_NAME, MB_ICONINFORMATION); return 0; }
           GetWindowTextW(d->eDir, d->destDir, MAX_PATH);
           Trim(d->destDir);
           if (!d->destDir[0]) { MessageBoxW(h, L"Укажите папку.", APP_NAME, MB_ICONINFORMATION); return 0; }
@@ -2043,7 +2119,7 @@ static BOOL RunExpDlg(ExpDlg *d)
   MSG msg;
   DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
   int w, hgt, x, y, ch, i;
-  ch = d->kind == 0 ? (d->n > 1 ? 506 : 456) : 330;
+  ch = d->kind == 0 ? (d->n > 1 ? 506 : 456) : 362;
   r.left = 0; r.top = 0; r.right = 580; r.bottom = ch;
   AdjustWindowRectEx(&r, style, FALSE, WS_EX_DLGMODALFRAME);
   w = r.right - r.left; hgt = r.bottom - r.top;
@@ -2155,6 +2231,7 @@ static void UpdateCount(void)
   wchar_t b[200];
   if (g_tab == 2) { SnapRefreshUI(); return; }
   if (g_tab == 3) { WatchRefreshUI(); return; }
+  if (g_tab == 4) { ProtRefreshUI(); return; }
   if (g_tab == 0) _snwprintf(b, 199, L"Отмечено веток: %d  (групповые действия)", CountChecked(TVI_ROOT));
   else _snwprintf(b, 199, L"Файлов в архиве: %d", SavedCountFiles(TVI_ROOT));
   b[199] = 0;
@@ -2260,11 +2337,22 @@ static void SwitchTab(int t)
   ShowWindow(g_hSnapInfo, t == 2 ? SW_SHOW : SW_HIDE);
   ShowWindow(g_hWatchInfo, t == 3 ? SW_SHOW : SW_HIDE);
   ShowWindow(g_hWatchLV, t == 3 ? SW_SHOW : SW_HIDE);
+  ShowWindow(g_hProtLV, t == 4 ? SW_SHOW : SW_HIDE);
+  ShowWindow(g_hProtLog, t == 4 ? SW_SHOW : SW_HIDE);
   for (k = 0; k < 3; k++) ShowWindow(g_hLbl[k], v0 ? SW_SHOW : SW_HIDE);
   ShowWindow(g_hName, v0 ? SW_SHOW : SW_HIDE);
   ShowWindow(g_hPath, v0 ? SW_SHOW : SW_HIDE);
   ShowWindow(g_hComment, v0 ? SW_SHOW : SW_HIDE);
   ShowWindow(g_hChkNew, v0 ? SW_SHOW : SW_HIDE);
+  if (t == 4) {
+    SetWindowTextW(g_hBtnJump, L"Добавить…");
+    SetWindowTextW(g_hBtnJumpNew, L"Убрать из списка");
+    SetWindowTextW(g_hBtnX[0], L"Запустить защиту");
+    SetWindowTextW(g_hBtnX[1], L"Открыть лог защиты");
+    SetWindowTextW(g_hBtnX[2], L"Автозапуск: выкл");
+    ProtRefreshUI();
+    return;
+  }
   if (t == 3) {
     SetWindowTextW(g_hBtnJump, L"Начать наблюдение…");
     SetWindowTextW(g_hBtnJumpNew, L"Остановить");
@@ -2640,9 +2728,19 @@ static void ActExpBat(void)
       if (d->batMode == 1 && !nw) continue;
       MakeBatName(name, 400, 250 - (int)wcslen(g_batDir) - 1 - 4, nw, tl.t[i].path);
       _snwprintf(full, MAX_PATH + 15, L"%ls\\%ls", g_batDir, name);
-      text = BuildBat(tl.t[i].path, nw);
-      if (text && WriteUtf8File(full, text)) made++; else failed++;
-      free(text);
+      if (d->fBat) {
+        text = BuildBat(tl.t[i].path, nw);
+        if (text && WriteUtf8File(full, text)) made++; else failed++;
+        free(text);
+      }
+      if (d->fVbs) {
+        wchar_t vfull[MAX_PATH + 16];
+        wcscpy(vfull, full);
+        wcscpy(vfull + wcslen(vfull) - 4, L".vbs");
+        text = BuildVbs(tl.t[i].path, nw);
+        if (text && WriteUtf16File(vfull, text)) made++; else failed++;
+        free(text);
+      }
     }
   }
   Log(L"Экспорт bat: создано %d, ошибок %d, папка %ls", made, failed, g_batDir);
@@ -2826,7 +2924,7 @@ typedef struct {
   size_t n, cap;
   DWORD keys, vals, errs;
   const Scope *scope;
-  BOOL ioerr, quiet;
+  BOOL ioerr, quiet, shallow;
   volatile LONG *cancel;
 } ScanCtx;
 
@@ -2919,7 +3017,7 @@ static void ScanKey(ScanCtx *c, HKEY h, const wchar_t *path, int depth)
     free(vals);
   }
 
-  if (nsub && depth < 500) {
+  if (nsub && depth < 500 && !c->shallow) {
     wchar_t **names = (wchar_t **)calloc(nsub, sizeof(wchar_t *));
     wchar_t *nm = (wchar_t *)malloc((maxsub + 2) * sizeof(wchar_t));
     int nn = 0;
@@ -2971,7 +3069,7 @@ typedef struct {
   Scope scope;
   wchar_t file[MAX_PATH + 16], name[200], start[32];
   DWORD keys, vals, errs;
-  BOOL ok, canceled, quiet;
+  BOOL ok, canceled, quiet, shallow;
   volatile LONG *cancel;
 } ScanJob;
 
@@ -2998,6 +3096,7 @@ static BOOL DoScanToFile(ScanJob *j)
   c.scope = &j->scope;
   c.cancel = j->cancel ? j->cancel : &g_cancel;
   c.quiet = j->quiet;
+  c.shallow = j->shallow;
   NowStr(j->start, 32);
   sc_line(&c, L"#KSNAP\t1");
   HdrLine(&c, L"#NAME", j->name);
@@ -3656,7 +3755,13 @@ static LRESULT CALLBACK SnapProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
       d->cExcl = Mk(h, L"BUTTON", L"Не учитывать «шумные» ветки (список в файле snapshot_exclude.txt)", WS_TABSTOP | BS_AUTOCHECKBOX, 8, y, W - 120, 20, IDS_EXCL, 0);
       SendMessageW(d->cExcl, BM_SETCHECK, BST_CHECKED, 0);
       Mk(h, L"BUTTON", L"Изменить список…", WS_TABSTOP, 8 + W - 112, y - 3, 112, 26, IDS_EDITEXCL, 0); y += 40;
-      Mk(h, L"BUTTON", d->mode ? L"Начать наблюдение" : L"Сделать снимок", WS_TABSTOP | BS_DEFPUSHBUTTON, 8 + W - 200, y, 110, 28, IDOK, 0);
+      if (d->mode == 2) {
+        EnableWindow(d->cHklm, FALSE); EnableWindow(d->cHkcu, FALSE); EnableWindow(d->cHku, FALSE);
+        SetWindowTextW(d->cExcl, L"Следить и за вложенными ветками (вся ветка, а не только сам ключ)");
+        ShowWindow(GetDlgItem(h, IDS_EDITEXCL), SW_HIDE);
+        SetWindowTextW(d->eName, L"-"); EnableWindow(d->eName, FALSE);
+      }
+      Mk(h, L"BUTTON", d->mode == 2 ? L"Добавить в список" : d->mode ? L"Начать наблюдение" : L"Сделать снимок", WS_TABSTOP | BS_DEFPUSHBUTTON, 8 + W - 200, y, 110, 28, IDOK, 0);
       Mk(h, L"BUTTON", L"Отмена", WS_TABSTOP, 8 + W - 82, y, 82, 28, IDCANCEL, 0);
       return 0;
     }
@@ -3698,7 +3803,7 @@ static BOOL RunSnapDlg(SnapDlg *d)
   if (x < 0) x = 0;
   if (y < 0) y = 0;
   EnableWindow(g_hMain, FALSE);
-  d->hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, CLS_SNAP, d->mode ? L"Наблюдение за реестром" : L"Новый снимок реестра", style, x, y, w, hgt, g_hMain, NULL, g_hInst, d);
+  d->hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, CLS_SNAP, d->mode == 2 ? L"Добавить в список защиты" : d->mode ? L"Наблюдение за реестром" : L"Новый снимок реестра", style, x, y, w, hgt, g_hMain, NULL, g_hInst, d);
   if (!d->hwnd) { EnableWindow(g_hMain, TRUE); return FALSE; }
   ShowWindow(d->hwnd, SW_SHOW);
   SetForegroundWindow(d->hwnd);
@@ -3947,39 +4052,226 @@ static void LvCol(HWND lv, int i, const wchar_t *t, int w)
   SendMessageW(lv, LVM_INSERTCOLUMNW, i, (LPARAM)&col);
 }
 
-/* режимы командной строки для скриптов и самопроверки:
- *   /snap файл.ksn "название" ветка [ветка...]   - снимок указанных веток
- *   /cmp  старый.ksn новый.ksn отчёт.txt         - сравнение двух снимков */
-static int CliSnap(int argc, wchar_t **argv)
-{
-  ScanJob *sj = (ScanJob *)calloc(1, sizeof *sj);
-  int i;
-  wcsncpy(sj->file, argv[2], MAX_PATH + 15);
-  wcsncpy(sj->name, argv[3], 199);
-  for (i = 4; i < argc; i++) { wchar_t norm[2048]; if (NormalizeKey(argv[i], norm, 2048)) ScAddRoot(&sj->scope, norm); }
-  ScNormalizeRoots(&sj->scope);
-  g_cancel = 0;
-  return DoScanToFile(sj) ? 0 : 1;
-}
-
-static int CliCmp(int argc, wchar_t **argv)
-{
-  CmpJob *j = (CmpJob *)calloc(1, sizeof *j);
-  (void)argc;
-  wcsncpy(j->fileA, argv[2], MAX_PATH + 15);
-  wcsncpy(j->fileB, argv[3], MAX_PATH + 15);
-  g_cancel = 0;
-  FreeDiff();
-  CompareWorker(j);
-  if (j->result != 1) return 2;
-  NowStr(g_cmpWhen, 32);
-  BuildSummary(g_cmpSummary, 900);
-  return WriteReport(argv[4]) ? 0 : 3;
-}
 
 /* ====================================================================
- *  v0.4: ветка из открытого regedit, наблюдение за реестром онлайн
+ *  v0.5: консоль, расширенная командная строка, «держать от изменений»,
+ *        правка веток в текстовом редакторе
  * ==================================================================== */
+
+/* ---- ключи командной строки ---- */
+typedef enum {
+  C_NONE = 0, C_HELP, C_VERSION, C_JUMP, C_JUMPM, C_ADD, C_GOTO, C_LIST, C_EXPORT, C_SAVETO, C_BAT, C_VBS,
+  C_SNAP, C_CMP, C_SNAPS, C_WATCH, C_HOLD, C_OPEN, C_OPENWITH, C_OPENNP, C_IMPORT, C_CLEANTMP, C_LOG, C_ADDREG, C_PROBE
+} CliCmd;
+
+typedef struct {
+  CliCmd cmd;
+  BOOL bad;
+  wchar_t badArg[200];
+  wchar_t *pos[64];
+  int npos;
+  BOOL noGui, yes, excl, norec, apply, newWin;
+  wchar_t out[MAX_PATH], cfg[MAX_PATH];
+} Cli;
+static Cli g_cli;
+
+static void ParseCli(int argc, wchar_t **argv)
+{
+  static const struct { const wchar_t *name; CliCmd c; } cmds[] = {
+    { L"?", C_HELP }, { L"help", C_HELP }, { L"h", C_HELP }, { L"version", C_VERSION },
+    { L"jump", C_JUMP }, { L"jumpm", C_JUMPM }, { L"add", C_ADD }, { L"goto", C_GOTO }, { L"list", C_LIST },
+    { L"export", C_EXPORT }, { L"saveto", C_SAVETO },
+    { L"bat", C_BAT }, { L"export-bat", C_BAT }, { L"vbs", C_VBS }, { L"export-vbs", C_VBS },
+    { L"snap", C_SNAP }, { L"cmp", C_CMP }, { L"snaps", C_SNAPS }, { L"watch", C_WATCH }, { L"hold", C_HOLD },
+    { L"open", C_OPEN }, { L"open-with", C_OPENWITH }, { L"open-notepad", C_OPENNP }, { L"import", C_IMPORT },
+    { L"clean-tmp", C_CLEANTMP }, { L"log", C_LOG }, { L"addreg", C_ADDREG }, { L"probe", C_PROBE }
+  };
+  int i;
+  size_t k;
+  memset(&g_cli, 0, sizeof g_cli);
+  for (i = 1; i < argc; i++) {
+    const wchar_t *a = argv[i], *nm;
+    BOOL found = FALSE;
+    if (a[0] != L'/' && a[0] != L'-') { if (g_cli.npos < 64) g_cli.pos[g_cli.npos++] = argv[i]; continue; }
+    nm = a;
+    while (*nm == L'/' || *nm == L'-') nm++;
+    if (!_wcsicmp(nm, L"noui") || !_wcsicmp(nm, L"nogui")) { g_cli.noGui = TRUE; continue; }
+    if (!_wcsicmp(nm, L"yes") || !_wcsicmp(nm, L"y")) { g_cli.yes = TRUE; continue; }
+    if (!_wcsicmp(nm, L"excl")) { g_cli.excl = TRUE; continue; }
+    if (!_wcsicmp(nm, L"norec")) { g_cli.norec = TRUE; continue; }
+    if (!_wcsicmp(nm, L"apply")) { g_cli.apply = TRUE; continue; }
+    if (!_wcsicmp(nm, L"new")) { g_cli.newWin = TRUE; continue; }
+    if (!_wcsicmp(nm, L"out") && i + 1 < argc) { wcsncpy(g_cli.out, argv[++i], MAX_PATH - 1); continue; }
+    if (!_wcsicmp(nm, L"cfg") && i + 1 < argc) { wcsncpy(g_cli.cfg, argv[++i], MAX_PATH - 1); continue; }
+    for (k = 0; k < sizeof cmds / sizeof cmds[0]; k++) {
+      if (!_wcsicmp(nm, cmds[k].name)) {
+        found = TRUE;
+        if (g_cli.cmd && g_cli.cmd != cmds[k].c) { g_cli.bad = TRUE; wcsncpy(g_cli.badArg, a, 199); }
+        else g_cli.cmd = cmds[k].c;
+        break;
+      }
+    }
+    if (!found) { g_cli.bad = TRUE; wcsncpy(g_cli.badArg, a, 199); }
+  }
+}
+
+/* ---- консольный вывод ---- */
+static HANDLE g_hCon;
+static BOOL g_conIsConsole, g_conReady;
+static volatile LONG g_ctrlc;
+
+static void ConInit(void)
+{
+  DWORD mode;
+  HANDLE h;
+  if (g_conReady) return;
+  g_conReady = TRUE;
+  h = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (h && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN) {
+    g_hCon = h;
+    g_conIsConsole = GetConsoleMode(h, &mode) ? TRUE : FALSE;
+    return;
+  }
+  if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+    h = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) { g_hCon = h; g_conIsConsole = TRUE; }
+  }
+}
+
+static void ConWrite(const wchar_t *s, size_t len)
+{
+  DWORD w;
+  if (!g_hCon || !len) return;
+  if (g_conIsConsole) { WriteConsoleW(g_hCon, s, (DWORD)len, &w, NULL); return; }
+  {
+    int n = WideCharToMultiByte(CP_UTF8, 0, s, (int)len, NULL, 0, NULL, NULL);
+    char *u = (char *)malloc(n + 1);
+    WideCharToMultiByte(CP_UTF8, 0, s, (int)len, u, n, NULL, NULL);
+    WriteFile(g_hCon, u, (DWORD)n, &w, NULL);
+    free(u);
+  }
+}
+
+/* форматированный вывод; \n превращается в \r\n */
+static void ConPrint(const wchar_t *fmt, ...)
+{
+  wchar_t *buf = (wchar_t *)malloc(16384 * sizeof(wchar_t)), *out = (wchar_t *)malloc(32768 * sizeof(wchar_t));
+  va_list ap;
+  size_t i, n = 0;
+  va_start(ap, fmt);
+  _vsnwprintf(buf, 16383, fmt, ap);
+  va_end(ap);
+  buf[16383] = 0;
+  for (i = 0; buf[i] && n < 32760; i++) {
+    if (buf[i] == L'\n' && (i == 0 || buf[i - 1] != L'\r')) out[n++] = L'\r';
+    out[n++] = buf[i];
+  }
+  ConWrite(out, n);
+  free(buf); free(out);
+}
+
+static void ConProgressHook(const wchar_t *t)
+{
+  wchar_t line[100];
+  if (!g_conIsConsole) return;
+  _snwprintf(line, 99, L"\r%-78.78ls", t);
+  line[99] = 0;
+  ConWrite(line, wcslen(line));
+}
+
+static void ConProgressEnd(void)
+{
+  if (g_conIsConsole && g_conProgress) ConWrite(L"\r                                                                              \r", 80);
+  g_conProgress = FALSE;
+}
+
+static BOOL ConAsk(const wchar_t *q)
+{
+  wchar_t line[64] = L"";
+  DWORD got = 0, mode;
+  HANDLE in;
+  if (g_cli.yes) return TRUE;
+  ConPrint(L"%ls [y/N] (д/н): ", q);
+  in = GetStdHandle(STD_INPUT_HANDLE);
+  if (!in || in == INVALID_HANDLE_VALUE || GetFileType(in) == FILE_TYPE_UNKNOWN)
+    in = CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+  if (!in || in == INVALID_HANDLE_VALUE) return FALSE;
+  if (GetConsoleMode(in, &mode)) {
+    ReadConsoleW(in, line, 63, &got, NULL);
+    line[got] = 0;
+  } else {
+    char b[64];
+    ReadFile(in, b, 63, &got, NULL);
+    b[got] = 0;
+    MultiByteToWideChar(CP_UTF8, 0, b, -1, line, 63);
+  }
+  {
+    wchar_t *p = line;
+    while (*p == L' ') p++;
+    return *p == L'y' || *p == L'Y' || *p == 0x0434 || *p == 0x0414;
+  }
+}
+
+static BOOL WINAPI CtrlHandler(DWORD t)
+{
+  if (t == CTRL_C_EVENT || t == CTRL_BREAK_EVENT || t == CTRL_CLOSE_EVENT) {
+    InterlockedExchange(&g_ctrlc, 1);
+    InterlockedExchange(&g_cancel, 1);
+    return TRUE;
+  }
+  return FALSE;
+}
+
+static const wchar_t *HELP_TEXT =
+  L"Key Shelf Reg Jumper " APP_VER_STR L" - командная строка\n"
+  L"Использование: KeyShelfRegJumper.exe [ключи]   (без ключей открывается окно программы)\n"
+  L"Ключи можно писать с / или с -. Ветки: HKLM\\..., HKCU\\..., HKEY_LOCAL_MACHINE\\... и т.д.\n\n"
+  L"ОБЩИЕ\n"
+  L"  /? | /help               эта справка          /version   версия\n"
+  L"  /nogui | /noui           только консоль: окно не показывается вообще (даже для /addreg)\n"
+  L"  /yes                     отвечать «да» на все вопросы\n"
+  L"  /cfg файл                использовать другой файл конфигурации\n"
+  L"  /log on|off              включить или выключить лог keyshelf.log\n\n"
+  L"ПЕРЕХОД И ЗАКЛАДКИ\n"
+  L"  /jump ветка              открыть regedit на ветке (режим NO: открытый regedit закрывается и запускается заново)\n"
+  L"  /jumpm ветка             то же в новом окне regedit /m (режим NW: другие окна не трогаются)\n"
+  L"  /goto \"имя|путь\" [/new]  перейти по закладке; /new - в новом окне\n"
+  L"  /add ветка [\"имя\"] [\"папка/подпапка\"]   добавить ветку в закладки\n"
+  L"  /list                    вывести закладки\n"
+  L"  /addreg файл.reg ...     добавить ветки из .reg (без /nogui откроется окно выбора)\n\n"
+  L"СОХРАНЕНИЕ И ЭКСПОРТ\n"
+  L"  /export ветка... файл.reg            выгрузить ветки в один .reg-файл\n"
+  L"  /saveto ветка... [\"заметка\"]         сохранить в архив Saved (дата, время и заметка в имени файла)\n"
+  L"  /bat | /export-bat ветка... [NO|NW|BOTH] [папка]   скрипт .bat, открывающий regedit на ветке\n"
+  L"  /vbs | /export-vbs ветка... [NO|NW|BOTH] [папка]   то же в виде .vbs (VBScript)\n"
+  L"      NO   (Normal Open) - обычный способ: уже открытый regedit закрывается и запускается заново на ветке\n"
+  L"      NW   (New Window)  - новое окно regedit /m: уже открытые окна не трогаются (по умолчанию)\n"
+  L"      BOTH - создать оба варианта. Имена файлов: NO-HKLM_SOFTWARE_...bat и NW-HKLM_SOFTWARE_...bat\n\n"
+  L"ПРАВКА В РЕДАКТОРЕ\n"
+  L"  /open ветка...           выгрузить в Saved\\tmp и открыть в редакторе по умолчанию (для .reg это команда «Правка», обычно Блокнот)\n"
+  L"  /open-notepad ветка...   то же в notepad.exe\n"
+  L"  /open-with редактор.exe ветка...   то же в указанном редакторе\n"
+  L"      Оригинал остаётся рядом (файл *.orig.reg). /apply - дождаться закрытия редактора и предложить внести правки.\n"
+  L"  /import файл.reg         внести .reg в реестр (с подтверждением; /yes - без вопроса)\n"
+  L"  /clean-tmp               очистить Saved\\tmp\n\n"
+  L"СНИМКИ И СРАВНЕНИЕ\n"
+  L"  /snap файл.ksn \"название\" ветка... [/excl]   снимок веток; /excl - без «шумных» веток\n"
+  L"  /snaps                                        список снимков\n"
+  L"  /cmp старый новый|current [отчёт.txt]         сравнить два снимка или снимок с текущим состоянием\n"
+  L"      снимок можно указать путём, именем файла в Snapshots или частью названия\n\n"
+  L"НАБЛЮДЕНИЕ И ЗАЩИТА\n"
+  L"  /watch [секунды] ветка... [/out файл]   наблюдать и печатать изменения в консоль в реальном времени;\n"
+  L"                                          без секунд - до Ctrl+C; /out - дополнительно писать события в файл\n"
+  L"  /hold [секунды] [ветка...] [/norec]     держать от изменений: при изменении или удалении вернуть исходное и записать в лог;\n"
+  L"                                          без веток - список из программы; /norec - только сам ключ без вложенных; стоп - Ctrl+C\n"
+  L"  /probe                                  прочитать текущую ветку из открытого regedit\n\n"
+  L"КОДЫ ВЫХОДА: 0 - успех, 1 - ошибка выполнения, 2 - неверные параметры, 3 - не найдено\n";
+
+static void ShowHelp(void)
+{
+  if (g_hCon) { ConPrint(L"%ls", HELP_TEXT); return; }
+  if (!g_cli.noGui) MessageBoxW(NULL, HELP_TEXT, L"Key Shelf Reg Jumper", MB_ICONINFORMATION);
+}
 
 /* ---- ветка из открытого regedit ---- */
 typedef struct { wchar_t out[2048]; BOOL ok; } KeyProbe;
@@ -4021,7 +4313,8 @@ static int GetRegeditKey(wchar_t *out)
   return 2;
 }
 
-enum { IDP_BOOK = 600, IDP_SAVE, IDP_SNAP, IDP_BAT, IDP_WATCH };
+/* ---- диалог «что сделать с веткой» ---- */
+enum { IDP_BOOK = 600, IDP_SAVE, IDP_SNAP, IDP_BAT, IDP_WATCH, IDP_HOLD, IDP_EDIT };
 
 typedef struct { HWND hwnd; wchar_t path[2048]; const wchar_t *src; BOOL done; int choice; } PickDlg;
 
@@ -4031,26 +4324,26 @@ static LRESULT CALLBACK PickProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
   switch (m) {
     case WM_CREATE: {
       CREATESTRUCTW *cs = (CREATESTRUCTW *)lp;
-      HWND e;
       d = (PickDlg *)cs->lpCreateParams;
       SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)d);
       d->hwnd = h;
       Mk(h, L"STATIC", d->src, 0, 10, 8, 440, 16, 90, 0);
-      e = Mk(h, L"EDIT", d->path, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 10, 28, 440, 46, 91, WS_EX_CLIENTEDGE);
-      (void)e;
+      Mk(h, L"EDIT", d->path, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 10, 28, 440, 46, 91, WS_EX_CLIENTEDGE);
       Mk(h, L"STATIC", L"Что сделать с этой веткой:", 0, 10, 82, 440, 16, 92, 0);
       Mk(h, L"BUTTON", L"В закладки", WS_TABSTOP | BS_DEFPUSHBUTTON, 10, 102, 218, 28, IDP_BOOK, 0);
       Mk(h, L"BUTTON", L"Сохранить в .reg…", WS_TABSTOP, 232, 102, 218, 28, IDP_SAVE, 0);
       Mk(h, L"BUTTON", L"В снимок для сравнения…", WS_TABSTOP, 10, 136, 218, 28, IDP_SNAP, 0);
-      Mk(h, L"BUTTON", L"Экспорт в .bat…", WS_TABSTOP, 232, 136, 218, 28, IDP_BAT, 0);
+      Mk(h, L"BUTTON", L"Экспорт скрипта (.bat / .vbs)…", WS_TABSTOP, 232, 136, 218, 28, IDP_BAT, 0);
       Mk(h, L"BUTTON", L"В наблюдение онлайн…", WS_TABSTOP, 10, 170, 218, 28, IDP_WATCH, 0);
-      Mk(h, L"BUTTON", L"Отмена", WS_TABSTOP, 232, 170, 218, 28, IDCANCEL, 0);
+      Mk(h, L"BUTTON", L"Держать от изменений", WS_TABSTOP, 232, 170, 218, 28, IDP_HOLD, 0);
+      Mk(h, L"BUTTON", L"Править в Блокноте…", WS_TABSTOP, 10, 204, 218, 28, IDP_EDIT, 0);
+      Mk(h, L"BUTTON", L"Отмена", WS_TABSTOP, 232, 204, 218, 28, IDCANCEL, 0);
       return 0;
     }
     case WM_COMMAND: {
       int id = LOWORD(wp);
       if (!d) break;
-      if ((id >= IDP_BOOK && id <= IDP_WATCH) || id == IDCANCEL) { d->choice = id == IDCANCEL ? 0 : id; d->done = TRUE; return 0; }
+      if ((id >= IDP_BOOK && id <= IDP_EDIT) || id == IDCANCEL) { d->choice = id == IDCANCEL ? 0 : id; d->done = TRUE; return 0; }
       break;
     }
     case WM_CLOSE: if (d) d->done = TRUE; return 0;
@@ -4061,7 +4354,7 @@ static LRESULT CALLBACK PickProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 static int RunPickDlg(const wchar_t *path, const wchar_t *src)
 {
   PickDlg d;
-  RECT r = { 0, 0, 460, 208 }, orc;
+  RECT r = { 0, 0, 460, 242 }, orc;
   MSG msg;
   DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
   int w, hgt, x, y;
@@ -4110,6 +4403,8 @@ static void AddBookmarkPath(const wchar_t *path)
 }
 
 static void ActWatchStart(void);
+static void ActEditInEditor(int kind);
+static void ProtAddPath(const wchar_t *path, BOOL rec);
 
 static void ActTakeBranch(void)
 {
@@ -4142,41 +4437,52 @@ static void ActTakeBranch(void)
     case IDP_SNAP: wcscpy(g_extraTarget, path); ActSnapNew(); g_extraTarget[0] = 0; SwitchTab(2); break;
     case IDP_BAT: wcscpy(g_extraTarget, path); ActExpBat(); g_extraTarget[0] = 0; break;
     case IDP_WATCH: wcscpy(g_extraTarget, path); ActWatchStart(); g_extraTarget[0] = 0; SwitchTab(3); break;
+    case IDP_HOLD: ProtAddPath(path, TRUE); SwitchTab(4); break;
+    case IDP_EDIT: wcscpy(g_extraTarget, path); ActEditInEditor(0); g_extraTarget[0] = 0; break;
   }
 }
 
-/* ---- наблюдение онлайн ---- */
+/* ====================================================================
+ *  общий движок наблюдения (kind: наблюдение) и защиты (kind: protect)
+ * ==================================================================== */
 typedef struct { wchar_t time[24]; DiffItem d; } WItem;
 static WItem *g_wev;
 static int g_nwev, g_capwev;
-static BOOL g_watching;
-static wchar_t g_watchLog[MAX_PATH + 16], g_watchStart[32], g_watchDir[MAX_PATH];
-static DWORD g_watchTotal;
+static wchar_t g_watchDir[MAX_PATH], g_protLog[MAX_PATH + 16];
 
 typedef struct {
   wchar_t root[2048];
+  BOOL rec, disabled;
   HKEY hkey;
   HANDLE ev;
-  wchar_t base[MAX_PATH + 16], fresh[MAX_PATH + 16];
+  wchar_t base[MAX_PATH + 16], fresh[MAX_PATH + 16], basereg[MAX_PATH + 16];
   BOOL pending;
-  DWORD pendTick, lastScan, lastDur, retryTick;
+  DWORD pendTick, lastScan, lastDur, retryTick, failUntil;
 } Watcher;
-static Watcher *g_wat;
-static int g_nwat;
-static Scope g_wscope;
-static HANDLE g_wthread;
-static volatile LONG g_wstop;
+
+typedef struct {
+  Watcher *w;
+  int n;
+  Scope scope;
+  HANDLE thread;
+  volatile LONG stop;
+  BOOL running, protect, conPrint;
+  wchar_t log[MAX_PATH + 16], start[32];
+  DWORD total;
+} WatchSet;
+static WatchSet g_obs, g_prot;
+static WatchSet *g_baseWs;
 
 #define WNOTIFY (REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY)
 
-static void WLogAppend(const wchar_t *line)
+static void WLogAppend(const wchar_t *file, const wchar_t *line)
 {
   HANDLE h;
   DWORD w;
   int n;
   char *u;
-  if (!g_watchLog[0]) return;
-  h = CreateFileW(g_watchLog, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (!file || !file[0]) return;
+  h = CreateFileW(file, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   if (h == INVALID_HANDLE_VALUE) return;
   if (GetFileSize(h, NULL) == 0) { static const BYTE bom[3] = { 0xEF, 0xBB, 0xBF }; WriteFile(h, bom, 3, &w, NULL); }
   n = WideCharToMultiByte(CP_UTF8, 0, line, -1, NULL, 0, NULL, NULL);
@@ -4188,7 +4494,18 @@ static void WLogAppend(const wchar_t *line)
   CloseHandle(h);
 }
 
-static void WatchPushEvents(DiffItem *items, int n)
+/* многострочное представление события для консоли */
+static void FmtEventBlock(WBuf *b, const wchar_t *ts, const DiffItem *d)
+{
+  const wchar_t *nm = d->name ? (d->name[0] ? d->name : L"(по умолчанию)") : NULL;
+  wb_addc(b, L'['); wb_adds(b, ts); wb_adds(b, L"] "); wb_adds(b, KindLabel(d->kind)); wb_adds(b, L"\n");
+  wb_adds(b, L"  Ветка:    "); wb_adds(b, d->key); wb_adds(b, L"\n");
+  if (nm) { wb_adds(b, L"  Значение: "); wb_adds(b, nm); wb_adds(b, L"\n"); }
+  if (d->o) { wb_adds(b, L"  Было:     "); wb_adds(b, d->o); wb_adds(b, L"\n"); }
+  if (d->n) { wb_adds(b, L"  Стало:    "); wb_adds(b, d->n); wb_adds(b, L"\n"); }
+}
+
+static void WatchPushEvents(WatchSet *ws, DiffItem *items, int n)
 {
   int i;
   wchar_t ts[32];
@@ -4196,23 +4513,25 @@ static void WatchPushEvents(DiffItem *items, int n)
   EnterCriticalSection(&g_wcs);
   for (i = 0; i < n; i++) {
     DiffItem *d = &items[i];
-    WBuf b = { 0 };
+    WBuf b = { 0 }, cb = { 0 };
     const wchar_t *nm = d->name ? (d->name[0] ? d->name : L"(по умолчанию)") : NULL;
     wb_addc(&b, L'['); wb_adds(&b, ts); wb_adds(&b, L"] "); wb_adds(&b, KindLabel(d->kind)); wb_adds(&b, L": "); wb_adds(&b, d->key);
     if (nm) { wb_adds(&b, L"  \\  "); wb_adds(&b, nm); }
     if (d->o) { wb_adds(&b, L"  |  было: "); wb_adds(&b, d->o); }
     if (d->n) { wb_adds(&b, L"  |  стало: "); wb_adds(&b, d->n); }
-    WLogAppend(b.p);
+    WLogAppend(ws->log, b.p);
     free(b.p);
+    if (ws->conPrint) { FmtEventBlock(&cb, ts, d); ConPrint(L"%ls\n", cb.p); }
+    free(cb.p);
     if (g_nwev < 200000) {
       WItem *w;
       if (g_nwev == g_capwev) { g_capwev = g_capwev ? g_capwev * 2 : 1024; g_wev = (WItem *)realloc(g_wev, g_capwev * sizeof(WItem)); }
       w = &g_wev[g_nwev++];
       wcscpy(w->time, ts);
-      w->d = *d; /* строки переходят во владение списка */
+      w->d = *d;
     } else { free(d->key); free(d->name); free(d->o); free(d->n); }
   }
-  g_watchTotal += n;
+  ws->total += n;
   LeaveCriticalSection(&g_wcs);
   if (g_hMain) PostMessageW(g_hMain, WM_APP_WATCH, 0, 0);
 }
@@ -4228,10 +4547,113 @@ static void WatchArm(Watcher *w)
   sub = sub ? sub + 1 : L"";
   if (RegOpenKeyExW(hive, sub, 0, KEY_NOTIFY | KEY_READ | KEY_WOW64_64KEY, &w->hkey) != ERROR_SUCCESS) { w->hkey = NULL; return; }
   ResetEvent(w->ev);
-  if (RegNotifyChangeKeyValue(w->hkey, TRUE, WNOTIFY, w->ev, TRUE) != ERROR_SUCCESS) { RegCloseKey(w->hkey); w->hkey = NULL; }
+  if (RegNotifyChangeKeyValue(w->hkey, w->rec ? TRUE : FALSE, WNOTIFY, w->ev, TRUE) != ERROR_SUCCESS) { RegCloseKey(w->hkey); w->hkey = NULL; }
 }
 
-static void WatchProcess(Watcher *w)
+/* ---- защита: возврат исходного состояния ---- */
+static void ProtEmit(const wchar_t *line)
+{
+  WLogAppend(g_protLog, line);
+  Log(L"Защита: %ls", line);
+  if (g_prot.conPrint) ConPrint(L"%ls\n\n", line);
+  if (g_hMain) PostMessageW(g_hMain, WM_APP_PROT, 0, (LPARAM)Dup(line));
+}
+
+static LONG DeleteRegValueAt(const wchar_t *key, const wchar_t *name)
+{
+  HKEY hive = HiveFromName(key), h;
+  const wchar_t *sub;
+  LONG r;
+  if (!hive) return ERROR_PATH_NOT_FOUND;
+  sub = wcschr(key, L'\\');
+  sub = sub ? sub + 1 : L"";
+  r = RegOpenKeyExW(hive, sub, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, &h);
+  if (r == ERROR_FILE_NOT_FOUND) return ERROR_SUCCESS;
+  if (r != ERROR_SUCCESS) return r;
+  r = RegDeleteValueW(h, name);
+  RegCloseKey(h);
+  return r == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : r;
+}
+
+static LONG DeleteRegKeyTreeAt(const wchar_t *key)
+{
+  wchar_t parent[2048], *sl;
+  HKEY hive, h;
+  const wchar_t *sub;
+  LONG r;
+  wcsncpy(parent, key, 2047); parent[2047] = 0;
+  sl = wcsrchr(parent, L'\\');
+  if (!sl) return ERROR_INVALID_PARAMETER;
+  *sl = 0;
+  hive = HiveFromName(parent);
+  if (!hive) return ERROR_PATH_NOT_FOUND;
+  sub = wcschr(parent, L'\\');
+  sub = sub ? sub + 1 : L"";
+  r = RegOpenKeyExW(hive, sub, 0, DELETE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY, &h);
+  if (r == ERROR_FILE_NOT_FOUND) return ERROR_SUCCESS;
+  if (r != ERROR_SUCCESS) return r;
+  r = RegDeleteTreeW(h, sl + 1);
+  RegCloseKey(h);
+  return r == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : r;
+}
+
+static void ProtectApply(Watcher *w, DiffItem *items, int n)
+{
+  int i;
+  BOOL needImport = FALSE, failed = FALSE;
+  wchar_t ts[32], msg[600];
+  NowStr(ts, 32);
+  g_prot.total += (DWORD)n;
+  for (i = 0; i < n; i++) {
+    DiffItem *d = &items[i];
+    WBuf b = { 0 };
+    const wchar_t *nm = d->name ? (d->name[0] ? d->name : L"(по умолчанию)") : L"";
+    wchar_t *key = d->key;
+    wb_addc(&b, L'['); wb_adds(&b, ts); wb_adds(&b, L"] ");
+    switch (d->kind) {
+      case DK_VALCHG:
+        wb_adds(&b, L"Изменилось значение «"); wb_adds(&b, nm); wb_adds(&b, L"» в "); wb_adds(&b, key);
+        wb_adds(&b, L": было "); wb_adds(&b, d->o ? d->o : L""); wb_adds(&b, L", стало "); wb_adds(&b, d->n ? d->n : L""); wb_adds(&b, L". Возвращаю.");
+        needImport = TRUE;
+        break;
+      case DK_VALDEL:
+        wb_adds(&b, L"Удалено значение «"); wb_adds(&b, nm); wb_adds(&b, L"» в "); wb_adds(&b, key);
+        wb_adds(&b, L" (было "); wb_adds(&b, d->o ? d->o : L""); wb_adds(&b, L"). Возвращаю.");
+        needImport = TRUE;
+        break;
+      case DK_VALADD:
+        wb_adds(&b, L"Добавлено значение «"); wb_adds(&b, nm); wb_adds(&b, L"» в "); wb_adds(&b, key);
+        wb_adds(&b, L" ("); wb_adds(&b, d->n ? d->n : L""); wb_adds(&b, L"). Удаляю.");
+        break;
+      case DK_KEYADD:
+        wb_adds(&b, L"Добавлена ветка "); wb_adds(&b, key); wb_adds(&b, L". Удаляю.");
+        break;
+      case DK_KEYDEL:
+        wb_adds(&b, L"Удалена ветка "); wb_adds(&b, key); wb_adds(&b, L". Возвращаю.");
+        needImport = TRUE;
+        break;
+    }
+    ProtEmit(b.p);
+    free(b.p);
+    if (d->kind == DK_VALADD) {
+      LONG r = DeleteRegValueAt(d->key, d->name ? d->name : L"");
+      if (r != ERROR_SUCCESS) { failed = TRUE; _snwprintf(msg, 599, L"    Не удалось удалить значение (код %ld). Нужны права администратора?", r); ProtEmit(msg); }
+    } else if (d->kind == DK_KEYADD) {
+      LONG r = DeleteRegKeyTreeAt(d->key);
+      if (r != ERROR_SUCCESS) { failed = TRUE; _snwprintf(msg, 599, L"    Не удалось удалить ветку (код %ld). Нужны права администратора?", r); ProtEmit(msg); }
+    }
+  }
+  if (needImport) {
+    wchar_t em[500];
+    int rc = RunRegImport(w->basereg, em, 500);
+    if (rc == 0) ProtEmit(L"    Исходные значения возвращены.");
+    else { failed = TRUE; _snwprintf(msg, 599, L"    Не удалось вернуть исходное (reg import, код %d): %ls Нужны права администратора?", rc, em); ProtEmit(msg); }
+  }
+  if (failed) { w->failUntil = GetTickCount() + 30000; ProtEmit(L"    Повторю попытку через 30 секунд."); }
+  for (i = 0; i < n; i++) { free(items[i].key); free(items[i].name); free(items[i].o); free(items[i].n); }
+}
+
+static void WatchProcess(WatchSet *ws, Watcher *w)
 {
   ScanJob *sj = (ScanJob *)calloc(1, sizeof *sj);
   Reader ra, rb;
@@ -4239,14 +4661,15 @@ static void WatchProcess(Watcher *w)
   DWORD t0 = GetTickCount();
   BOOL ok;
   ScAddRoot(&sj->scope, w->root);
-  for (i = 0; i < g_wscope.nexcl; i++) ScAddExcl(&sj->scope, g_wscope.excl[i]);
+  for (i = 0; i < ws->scope.nexcl; i++) ScAddExcl(&sj->scope, ws->scope.excl[i]);
   wcscpy(sj->file, w->fresh);
   wcscpy(sj->name, L"watch");
   sj->quiet = TRUE;
-  sj->cancel = &g_wstop;
+  sj->shallow = !w->rec;
+  sj->cancel = &ws->stop;
   if (DoScanToFile(sj)) {
-    DiffItem *items;
-    int n;
+    DiffItem *items = NULL;
+    int n = 0;
     memset(&ra, 0, sizeof ra); memset(&rb, 0, sizeof rb);
     ok = RdOpen(&ra, w->base);
     if (ok) ok = RdOpen(&rb, w->fresh);
@@ -4260,10 +4683,10 @@ static void WatchProcess(Watcher *w)
       g_sink = NULL; g_nsink = g_capsink = 0;
       LeaveCriticalSection(&g_mergeCs);
       RdClose(&ra); RdClose(&rb);
-      if (n > 0) WatchPushEvents(items, n);
+      if (n > 0) { if (ws->protect) ProtectApply(w, items, n); else WatchPushEvents(ws, items, n); }
       free(items);
-      DeleteFileW(w->base);
-      MoveFileExW(w->fresh, w->base, MOVEFILE_REPLACE_EXISTING);
+      if (ws->protect) DeleteFileW(w->fresh);
+      else { DeleteFileW(w->base); MoveFileExW(w->fresh, w->base, MOVEFILE_REPLACE_EXISTING); }
     } else {
       RdClose(&ra); RdClose(&rb);
       DeleteFileW(w->fresh);
@@ -4276,12 +4699,13 @@ static void WatchProcess(Watcher *w)
 
 static DWORD WINAPI WatchThread(LPVOID p)
 {
-  (void)p;
-  while (!g_wstop) {
+  WatchSet *ws = (WatchSet *)p;
+  while (!ws->stop) {
     int i;
-    for (i = 0; i < g_nwat && !g_wstop; i++) {
-      Watcher *w = &g_wat[i];
+    for (i = 0; i < ws->n && !ws->stop; i++) {
+      Watcher *w = &ws->w[i];
       DWORD now = GetTickCount(), minGap;
+      if (w->disabled) continue;
       if (!w->hkey) {
         if (now - w->retryTick >= 1000) {
           w->retryTick = now;
@@ -4290,13 +4714,13 @@ static DWORD WINAPI WatchThread(LPVOID p)
         }
       } else if (WaitForSingleObject(w->ev, 0) == WAIT_OBJECT_0) {
         ResetEvent(w->ev);
-        if (RegNotifyChangeKeyValue(w->hkey, TRUE, WNOTIFY, w->ev, TRUE) != ERROR_SUCCESS) { RegCloseKey(w->hkey); w->hkey = NULL; }
+        if (RegNotifyChangeKeyValue(w->hkey, w->rec ? TRUE : FALSE, WNOTIFY, w->ev, TRUE) != ERROR_SUCCESS) { RegCloseKey(w->hkey); w->hkey = NULL; }
         if (!w->pending) { w->pending = TRUE; w->pendTick = now; }
       }
       minGap = w->lastDur * 2 > 1000 ? w->lastDur * 2 : 1000;
-      if (w->pending && now - w->pendTick >= 600 && now - w->lastScan >= minGap) {
+      if (w->pending && now - w->pendTick >= 600 && now - w->lastScan >= minGap && (LONG)(now - w->failUntil) >= 0) {
         w->pending = FALSE;
-        WatchProcess(w);
+        WatchProcess(ws, w);
         w->lastScan = GetTickCount();
       }
     }
@@ -4305,28 +4729,29 @@ static DWORD WINAPI WatchThread(LPVOID p)
   return 0;
 }
 
-static void WatchAddRoot(const wchar_t *root)
+static void WatchAddRoot(WatchSet *ws, const wchar_t *root, BOOL rec)
 {
   Watcher *w;
-  if (g_nwat >= 300) return;
-  g_wat = (Watcher *)realloc(g_wat, (g_nwat + 1) * sizeof(Watcher));
-  w = &g_wat[g_nwat];
+  if (ws->n >= 300) return;
+  ws->w = (Watcher *)realloc(ws->w, (ws->n + 1) * sizeof(Watcher));
+  w = &ws->w[ws->n];
   memset(w, 0, sizeof *w);
   wcsncpy(w->root, root, 2047);
+  w->rec = rec;
   w->ev = CreateEventW(NULL, TRUE, FALSE, NULL);
-  g_nwat++;
+  ws->n++;
 }
 
-static void WatchFreeAll(BOOL delFiles)
+static void WatchFreeAll(WatchSet *ws, BOOL delFiles)
 {
   int i;
-  for (i = 0; i < g_nwat; i++) {
-    if (g_wat[i].hkey) RegCloseKey(g_wat[i].hkey);
-    if (g_wat[i].ev) CloseHandle(g_wat[i].ev);
-    if (delFiles) { DeleteFileW(g_wat[i].base); DeleteFileW(g_wat[i].fresh); }
+  for (i = 0; i < ws->n; i++) {
+    if (ws->w[i].hkey) RegCloseKey(ws->w[i].hkey);
+    if (ws->w[i].ev) CloseHandle(ws->w[i].ev);
+    if (delFiles) { DeleteFileW(ws->w[i].base); DeleteFileW(ws->w[i].fresh); DeleteFileW(ws->w[i].basereg); }
   }
-  free(g_wat);
-  g_wat = NULL; g_nwat = 0;
+  free(ws->w);
+  ws->w = NULL; ws->n = 0;
 }
 
 typedef struct { int canceled, failed; } WBaseRes;
@@ -4334,17 +4759,30 @@ typedef struct { int canceled, failed; } WBaseRes;
 static DWORD WINAPI WatchBaseWorker(LPVOID p)
 {
   WBaseRes *r = (WBaseRes *)p;
+  WatchSet *ws = g_baseWs;
   int i, k;
-  for (i = 0; i < g_nwat; i++) {
+  for (i = 0; i < ws->n; i++) {
     ScanJob *sj;
+    Watcher *w = &ws->w[i];
     if (g_cancel) { r->canceled = 1; break; }
-    SetBusy(L"Исходное состояние %d из %d: %ls", i + 1, g_nwat, g_wat[i].root);
+    SetBusy(L"Исходное состояние %d из %d: %ls", i + 1, ws->n, w->root);
+    if (ws->protect) {
+      wchar_t em[500], line[900];
+      int rc = RunRegExport(w->root, w->basereg, em, 500);
+      if (rc != 0) {
+        w->disabled = TRUE;
+        _snwprintf(line, 899, L"Не удалось взять исходное состояние ветки %ls (%ls): защита для неё не включена.", w->root, em);
+        ProtEmit(line);
+        continue;
+      }
+    }
     sj = (ScanJob *)calloc(1, sizeof *sj);
-    ScAddRoot(&sj->scope, g_wat[i].root);
-    for (k = 0; k < g_wscope.nexcl; k++) ScAddExcl(&sj->scope, g_wscope.excl[k]);
-    wcscpy(sj->file, g_wat[i].base);
+    ScAddRoot(&sj->scope, w->root);
+    for (k = 0; k < ws->scope.nexcl; k++) ScAddExcl(&sj->scope, ws->scope.excl[k]);
+    wcscpy(sj->file, w->base);
     wcscpy(sj->name, L"watch");
     sj->quiet = TRUE;
+    sj->shallow = !w->rec;
     if (!DoScanToFile(sj)) { if (g_cancel) r->canceled = 1; else r->failed++; ScFree(&sj->scope); free(sj); if (r->canceled) break; continue; }
     ScFree(&sj->scope); free(sj);
   }
@@ -4352,22 +4790,78 @@ static DWORD WINAPI WatchBaseWorker(LPVOID p)
   return 0;
 }
 
-/* запуск наблюдения за областью; ui - показывать окно прогресса */
-static BOOL WatchBegin(const Scope *user, BOOL ui)
+/* общий запуск: открыть ключи, взять исходное состояние, стартовать поток */
+static BOOL WatchLaunch(WatchSet *ws, BOOL ui)
 {
-  int i, k;
+  int i, active = 0;
   wchar_t ts[32], tsf[32], hdr[400];
   WBaseRes res;
-  Scope *ws = &g_wscope;
-  memset(ws, 0, sizeof *ws);
-  for (i = 0; i < user->nexcl; i++) ScAddExcl(ws, user->excl[i]);
-  g_nwat = 0; g_wat = NULL;
   EnsureDir(g_watchDir);
   MakeTimestamp(tsf, 32);
+  for (i = 0; i < ws->n; i++) {
+    Watcher *w = &ws->w[i];
+    _snwprintf(w->base, MAX_PATH + 15, L"%ls\\%lc%ls_%d_base.tmp", g_watchDir, ws->protect ? L'p' : L'w', tsf, i);
+    _snwprintf(w->fresh, MAX_PATH + 15, L"%ls\\%lc%ls_%d_new.tmp", g_watchDir, ws->protect ? L'p' : L'w', tsf, i);
+    _snwprintf(w->basereg, MAX_PATH + 15, L"%ls\\%lc%ls_%d_base.reg", g_watchDir, ws->protect ? L'p' : L'w', tsf, i);
+    WatchArm(w);
+    if (!w->hkey) Log(L"Слежение: не удалось открыть для слежения %ls", w->root);
+  }
+  g_baseWs = ws;
+  memset(&res, 0, sizeof res);
+  if (ui) RunBusy(WatchBaseWorker, &res, ws->protect ? L"Защита: исходное состояние" : L"Наблюдение: исходное состояние");
+  else { InterlockedExchange(&g_cancel, 0); WatchBaseWorker(&res); }
+  if (res.canceled) { WatchFreeAll(ws, TRUE); ScFree(&ws->scope); return FALSE; }
+  for (i = 0; i < ws->n; i++) if (!ws->w[i].disabled) active++;
+  if (active == 0) { WatchFreeAll(ws, TRUE); ScFree(&ws->scope); return FALSE; }
+  NowStr(ts, 32);
+  wcscpy(ws->start, ts);
+  ws->total = 0;
+  if (!ws->protect && !ws->log[0]) _snwprintf(ws->log, MAX_PATH + 15, L"%ls\\watch_%ls.log", g_watchDir, tsf);
+  _snwprintf(hdr, 399, L"[%ls] %ls. Областей: %d", ts, ws->protect ? L"Защита от изменений включена" : L"Наблюдение начато", active);
+  WLogAppend(ws->log, hdr);
+  for (i = 0; i < ws->n && i < 50; i++) {
+    if (ws->w[i].disabled) continue;
+    _snwprintf(hdr, 399, L"    %ls%ls", ws->w[i].root, ws->protect && !ws->w[i].rec ? L"  (только сам ключ)" : L"");
+    WLogAppend(ws->log, hdr);
+  }
+  ws->stop = 0;
+  ws->running = TRUE;
+  ws->thread = CreateThread(NULL, 0, WatchThread, ws, 0, NULL);
+  Log(L"%ls: областей %d, лог %ls", ws->protect ? L"Защита включена" : L"Наблюдение начато", active, ws->log);
+  return TRUE;
+}
+
+static void WatchStopSet(WatchSet *ws)
+{
+  wchar_t ts[32], line[300];
+  if (!ws->running) return;
+  InterlockedExchange(&ws->stop, 1);
+  if (ws->thread) { WaitForSingleObject(ws->thread, 20000); CloseHandle(ws->thread); ws->thread = NULL; }
+  NowStr(ts, 32);
+  _snwprintf(line, 299, L"[%ls] %ls. Событий: %lu", ts, ws->protect ? L"Защита остановлена" : L"Наблюдение остановлено", ws->total);
+  WLogAppend(ws->log, line);
+  WatchFreeAll(ws, TRUE);
+  ScFree(&ws->scope);
+  ws->running = FALSE;
+  Log(L"%ls, событий %lu", ws->protect ? L"Защита остановлена" : L"Наблюдение остановлено", ws->total);
+  if (g_hMain) PostMessageW(g_hMain, WM_APP_WATCH, 0, 0);
+}
+
+static void WatchStop(void) { WatchStopSet(&g_obs); }
+static void WatchStopAll(void) { WatchStopSet(&g_obs); WatchStopSet(&g_prot); }
+
+/* наблюдение за областью; целые разделы дробятся на крупные подветки */
+static BOOL ObsBegin(const Scope *user, BOOL ui, const wchar_t *logOverride, BOOL conPrint)
+{
+  int i, k;
+  WatchSet *ws = &g_obs;
+  memset(ws, 0, sizeof *ws);
+  ws->conPrint = conPrint;
+  if (logOverride && logOverride[0]) wcsncpy(ws->log, logOverride, MAX_PATH + 15);
+  for (i = 0; i < user->nexcl; i++) ScAddExcl(&ws->scope, user->excl[i]);
   for (i = 0; i < user->nroots; i++) {
     const wchar_t *root = user->roots[i];
     if (!wcschr(root, L'\\')) {
-      /* целый раздел: дробим на крупные подветки, иначе любое изменение вызывало бы пересканирование всего раздела */
       HKEY hive = HiveFromName(root), h;
       DWORD nsub = 0, maxsub = 0, j;
       if (hive && RegOpenKeyExW(hive, L"", 0, KEY_READ | KEY_WOW64_64KEY, &h) == ERROR_SUCCESS) {
@@ -4380,57 +4874,236 @@ static BOOL WatchBegin(const Scope *user, BOOL ui)
             if (RegEnumKeyExW(h, j, nm, &nl, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) continue;
             _snwprintf(sub, 2099, L"%ls\\%ls", root, nm);
             sub[2099] = 0;
-            for (k = 0; k < ws->nexcl; k++) if (IsUnderPath(sub, ws->excl[k])) excl = TRUE;
+            for (k = 0; k < ws->scope.nexcl; k++) if (IsUnderPath(sub, ws->scope.excl[k])) excl = TRUE;
             if (_wcsicmp(sub, L"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet") == 0) excl = TRUE;
-            if (!excl) WatchAddRoot(sub);
+            if (!excl) WatchAddRoot(ws, sub, TRUE);
           }
           free(nm);
         }
         RegCloseKey(h);
       }
-    } else WatchAddRoot(root);
+    } else WatchAddRoot(ws, root, TRUE);
   }
-  if (g_nwat == 0) { WatchFreeAll(FALSE); ScFree(ws); return FALSE; }
-  for (i = 0; i < g_nwat; i++) {
-    _snwprintf(g_wat[i].base, MAX_PATH + 15, L"%ls\\w%ls_%d_base.tmp", g_watchDir, tsf, i);
-    _snwprintf(g_wat[i].fresh, MAX_PATH + 15, L"%ls\\w%ls_%d_new.tmp", g_watchDir, tsf, i);
-    WatchArm(&g_wat[i]);
-    if (!g_wat[i].hkey) Log(L"Наблюдение: не удалось открыть для слежения %ls", g_wat[i].root);
-  }
-  memset(&res, 0, sizeof res);
-  if (ui) RunBusy(WatchBaseWorker, &res, L"Наблюдение: исходное состояние");
-  else { InterlockedExchange(&g_cancel, 0); WatchBaseWorker(&res); }
-  if (res.canceled) { WatchFreeAll(TRUE); ScFree(ws); return FALSE; }
-  NowStr(ts, 32);
-  wcscpy(g_watchStart, ts);
-  _snwprintf(g_watchLog, MAX_PATH + 15, L"%ls\\watch_%ls.log", g_watchDir, tsf);
-  g_watchTotal = 0;
-  _snwprintf(hdr, 399, L"[%ls] Наблюдение начато. Областей слежения: %d", ts, g_nwat);
-  WLogAppend(hdr);
-  for (i = 0; i < g_nwat && i < 50; i++) { _snwprintf(hdr, 399, L"    %ls", g_wat[i].root); WLogAppend(hdr); }
-  g_wstop = 0;
-  g_watching = TRUE;
-  g_wthread = CreateThread(NULL, 0, WatchThread, NULL, 0, NULL);
-  Log(L"Наблюдение начато: областей %d, лог %ls", g_nwat, g_watchLog);
-  return TRUE;
+  if (ws->n == 0) { ScFree(&ws->scope); return FALSE; }
+  return WatchLaunch(ws, ui);
 }
 
-static void WatchStop(void)
+/* ---- список защиты (хранится в конфигурации) ---- */
+typedef struct { wchar_t path[2048]; BOOL rec; } ProtItem;
+static ProtItem *g_pitems;
+static int g_npitems, g_cappitems;
+static BOOL g_protAuto;
+
+static void ProtLoad(void)
 {
-  wchar_t ts[32], line[300];
-  if (!g_watching) return;
-  InterlockedExchange(&g_wstop, 1);
-  if (g_wthread) { WaitForSingleObject(g_wthread, 20000); CloseHandle(g_wthread); g_wthread = NULL; }
-  NowStr(ts, 32);
-  _snwprintf(line, 299, L"[%ls] Наблюдение остановлено. Всего событий: %lu", ts, g_watchTotal);
-  WLogAppend(line);
-  WatchFreeAll(TRUE);
-  ScFree(&g_wscope);
-  g_watching = FALSE;
-  Log(L"Наблюдение остановлено, событий %lu", g_watchTotal);
-  if (g_hMain) PostMessageW(g_hMain, WM_APP_WATCH, 0, 0);
+  int i, n = (int)CfgGetInt(L"Protect", L"Count", 0);
+  g_protAuto = CfgGetInt(L"Protect", L"AutoStart", 0) != 0;
+  free(g_pitems);
+  g_pitems = NULL; g_npitems = g_cappitems = 0;
+  for (i = 0; i < n && i < 500; i++) {
+    wchar_t key[32], val[2100], norm[2048];
+    _snwprintf(key, 31, L"Item%d", i + 1);
+    CfgGetStr(L"Protect", key, L"", val, 2100);
+    if (!val[0]) continue;
+    if (g_npitems == g_cappitems) { g_cappitems = g_cappitems ? g_cappitems * 2 : 16; g_pitems = (ProtItem *)realloc(g_pitems, g_cappitems * sizeof(ProtItem)); }
+    if (val[1] == L'|' && NormalizeKey(val + 2, norm, 2048)) {
+      wcscpy(g_pitems[g_npitems].path, norm);
+      g_pitems[g_npitems].rec = val[0] != L'0';
+      g_npitems++;
+    }
+  }
 }
 
+static void ProtSaveCfg(void)
+{
+  int i;
+  wchar_t key[32], val[2100], num[16];
+  CfgDeleteSection(L"Protect");
+  _snwprintf(num, 15, L"%d", g_npitems);
+  CfgSet(L"Protect", L"Count", num);
+  CfgSet(L"Protect", L"AutoStart", g_protAuto ? L"1" : L"0");
+  for (i = 0; i < g_npitems; i++) {
+    _snwprintf(key, 31, L"Item%d", i + 1);
+    _snwprintf(val, 2099, L"%c|%ls", g_pitems[i].rec ? L'1' : L'0', g_pitems[i].path);
+    CfgSet(L"Protect", key, val);
+  }
+}
+
+static void ProtRefreshUI(void)
+{
+  int i;
+  if (!g_hProtLV) return;
+  ListView_DeleteAllItems(g_hProtLV);
+  for (i = 0; i < g_npitems; i++) {
+    LVITEMW it;
+    memset(&it, 0, sizeof it);
+    it.mask = LVIF_TEXT; it.iItem = i; it.pszText = g_pitems[i].path;
+    ListView_InsertItem(g_hProtLV, &it);
+    ListView_SetItemText(g_hProtLV, i, 1, g_pitems[i].rec ? (LPWSTR)L"вся ветка" : (LPWSTR)L"только ключ");
+    ListView_SetItemText(g_hProtLV, i, 2, g_prot.running ? (LPWSTR)L"защищается" : (LPWSTR)L"");
+  }
+  if (g_tab == 4) {
+    wchar_t cnt[120];
+    _snwprintf(cnt, 119, L"В списке: %d. Защита: %ls. Автозапуск: %ls", g_npitems, g_prot.running ? L"ВКЛ" : L"выкл", g_protAuto ? L"да" : L"нет");
+    SetWindowTextW(g_hCount, cnt);
+    SetWindowTextW(g_hBtnX[0], g_prot.running ? L"Остановить защиту" : L"Запустить защиту");
+    SetWindowTextW(g_hBtnX[2], g_protAuto ? L"Автозапуск: вкл" : L"Автозапуск: выкл");
+    EnableWindow(g_hBtnX[0], TRUE);
+    EnableWindow(g_hBtnX[1], g_protLog[0] != 0);
+    EnableWindow(g_hBtnX[2], TRUE);
+    EnableWindow(g_hBtnJump, TRUE);
+    EnableWindow(g_hBtnJumpNew, g_npitems > 0);
+  }
+}
+
+static void ProtAddPath(const wchar_t *path, BOOL rec)
+{
+  wchar_t norm[2048];
+  int i;
+  if (!NormalizeKey(path, norm, 2048) || !wcschr(norm, L'\\')) {
+    MessageBoxW(g_hMain, L"Защита целого раздела (HKEY_...) не поддерживается: укажите конкретную ветку.", APP_NAME, MB_ICONINFORMATION);
+    return;
+  }
+  for (i = 0; i < g_npitems; i++) if (_wcsicmp(g_pitems[i].path, norm) == 0) { g_pitems[i].rec = rec; ProtSaveCfg(); ProtRefreshUI(); return; }
+  if (g_npitems == g_cappitems) { g_cappitems = g_cappitems ? g_cappitems * 2 : 16; g_pitems = (ProtItem *)realloc(g_pitems, g_cappitems * sizeof(ProtItem)); }
+  wcscpy(g_pitems[g_npitems].path, norm);
+  g_pitems[g_npitems].rec = rec;
+  g_npitems++;
+  ProtSaveCfg();
+  ProtRefreshUI();
+  if (g_prot.running) MessageBoxW(g_hMain, L"Ветка добавлена в список. Чтобы она стала защищаться, остановите и снова запустите защиту (исходным состоянием будет считаться текущее).", APP_NAME, MB_ICONINFORMATION);
+}
+
+/* запуск защиты по списку; ui - окно прогресса */
+static BOOL ProtBegin(const ProtItem *items, int n, BOOL ui, BOOL conPrint)
+{
+  int i;
+  WatchSet *ws = &g_prot;
+  memset(ws, 0, sizeof *ws);
+  ws->protect = TRUE;
+  ws->conPrint = conPrint;
+  wcsncpy(ws->log, g_protLog, MAX_PATH + 15);
+  for (i = 0; i < n; i++) {
+    if (!wcschr(items[i].path, L'\\')) { Log(L"Защита: пропущен целый раздел %ls", items[i].path); continue; }
+    WatchAddRoot(ws, items[i].path, items[i].rec);
+  }
+  if (ws->n == 0) { ScFree(&ws->scope); return FALSE; }
+  return WatchLaunch(ws, ui);
+}
+
+/* ---- правка веток в текстовом редакторе ---- */
+static void ClearTmpDir(void)
+{
+  WIN32_FIND_DATAW fd;
+  HANDLE h;
+  wchar_t pat[MAX_PATH + 8], full[MAX_PATH + 8];
+  _snwprintf(pat, MAX_PATH + 7, L"%ls\\*", g_tmpDir);
+  h = FindFirstFileW(pat, &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+      _snwprintf(full, MAX_PATH + 7, L"%ls\\%ls", g_tmpDir, fd.cFileName);
+      SetFileAttributesW(full, FILE_ATTRIBUTE_NORMAL);
+      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveDirectoryW(full); else DeleteFileW(full);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  RemoveDirectoryW(g_tmpDir);
+}
+
+/* выгрузка веток в Saved\tmp; рядом кладётся неизменяемая копия оригинала *.orig.reg */
+static BOOL EditExport(TargetList *tl, BOOL ui, wchar_t *editFile, wchar_t *origFile, wchar_t *err)
+{
+  SaveJob *job = (SaveJob *)calloc(1, sizeof *job);
+  BOOL ok = FALSE;
+  err[0] = 0;
+  EnsureDir(g_tmpDir);
+  job->tl = tl;
+  wcsncpy(job->dir, g_tmpDir, MAX_PATH - 1);
+  MakeTimestamp(job->ts, 32);
+  job->useTag = TRUE;
+  job->combine = tl->n > 1;
+  if (ui) RunBusy(SaveWorker, job, L"Выгрузка для правки");
+  else { InterlockedExchange(&g_cancel, 0); SaveWorker(job); }
+  if (job->ok > 0 && job->firstFile[0]) {
+    size_t l;
+    wcscpy(editFile, job->firstFile);
+    wcscpy(origFile, job->firstFile);
+    l = wcslen(origFile);
+    if (l > 4) wcscpy(origFile + l - 4, L".orig.reg");
+    if (CopyFileW(editFile, origFile, FALSE)) { SetFileAttributesW(origFile, FILE_ATTRIBUTE_READONLY); ok = TRUE; }
+    else wcscpy(err, L"не удалось сохранить копию оригинала");
+  } else wcsncpy(err, job->firstErr[0] ? job->firstErr : L"не удалось выгрузить ветку", 299);
+  free(job);
+  return ok;
+}
+
+/* kind: 0 - редактор по умолчанию («Правка» для .reg), 1 - указанный exe, 2 - notepad.exe */
+static BOOL LaunchEditor(int kind, const wchar_t *exe, const wchar_t *file, HANDLE *hp)
+{
+  SHELLEXECUTEINFOW si;
+  wchar_t args[MAX_PATH + 8];
+  BOOL ok;
+  *hp = NULL;
+  memset(&si, 0, sizeof si);
+  si.cbSize = sizeof si;
+  si.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+  si.nShow = SW_SHOWNORMAL;
+  if (kind == 0) {
+    si.lpVerb = L"edit";
+    si.lpFile = file;
+    if (ShellExecuteExW(&si)) { *hp = si.hProcess; return TRUE; }
+    Log(L"Правка: у .reg нет команды «Правка», открываю в notepad.exe");
+    kind = 2;
+    memset(&si, 0, sizeof si);
+    si.cbSize = sizeof si;
+    si.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    si.nShow = SW_SHOWNORMAL;
+  }
+  _snwprintf(args, MAX_PATH + 7, L"\"%ls\"", file);
+  si.lpFile = kind == 1 ? exe : L"notepad.exe";
+  si.lpParameters = args;
+  ok = ShellExecuteExW(&si);
+  if (ok) *hp = si.hProcess;
+  return ok;
+}
+
+static void ActEditInEditor(int kind)
+{
+  TargetList tl;
+  wchar_t editF[MAX_PATH + 16], origF[MAX_PATH + 16], err[300], exe[MAX_PATH] = L"", msg[1500];
+  HANDLE hp = NULL;
+  if (g_tab != 0 && !g_extraTarget[0]) { MessageBoxW(g_hMain, L"Откройте вкладку «Закладки» и выберите или отметьте ветки.", APP_NAME, MB_ICONINFORMATION); return; }
+  memset(&tl, 0, sizeof tl);
+  CollectTargets(&tl);
+  if (tl.n == 0) { MessageBoxW(g_hMain, L"Нечего править: выберите ветку (или папку с ветками) либо отметьте ветки флажками.", APP_NAME, MB_ICONINFORMATION); free(tl.t); return; }
+  if (kind == 1) {
+    OPENFILENAMEW o;
+    memset(&o, 0, sizeof o);
+    o.lStructSize = sizeof o; o.hwndOwner = g_hMain;
+    o.lpstrFilter = L"Программы (*.exe)\0*.exe\0Все файлы\0*.*\0";
+    o.lpstrFile = exe; o.nMaxFile = MAX_PATH; o.lpstrTitle = L"Выберите текстовый редактор";
+    o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&o)) { free(tl.t); return; }
+  }
+  if (!EditExport(&tl, TRUE, editF, origF, err)) {
+    _snwprintf(msg, 1499, L"Не удалось выгрузить ветку для правки: %ls", err);
+    MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONERROR);
+    free(tl.t);
+    return;
+  }
+  free(tl.t);
+  if (!LaunchEditor(kind, exe, editF, &hp)) { MessageBoxW(g_hMain, L"Не удалось запустить редактор.", APP_NAME, MB_ICONERROR); return; }
+  if (hp) CloseHandle(hp);
+  SavedRefresh(editF);
+  SwitchTab(1);
+  _snwprintf(msg, 1499, L"Файл открыт в редакторе:\n%ls\n\nОригинал сохранён (его можно вернуть в реестр при ошибке):\n%ls\n\n"
+             L"Когда закончите правки и сохраните файл: вкладка «Сохранённые» → папка tmp → выберите файл → «Восстановить в реестр». "
+             L"Временная папка очищается при выходе из программы%ls.", editF, origF, g_clearTmp ? L"" : L" (сейчас очистка выключена в настройках)");
+  MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONINFORMATION);
+}
+
+/* ---- интерфейс вкладки «Наблюдение» ---- */
 static void WatchClearEvents(void)
 {
   int i;
@@ -4441,23 +5114,22 @@ static void WatchClearEvents(void)
   LeaveCriticalSection(&g_wcs);
 }
 
-/* ---- интерфейс вкладки «Наблюдение» ---- */
 static void WatchRefreshUI(void)
 {
   WBuf b = { 0 };
   wchar_t tmp[700];
   int i;
   if (!g_hWatchInfo) return;
-  wb_adds(&b, g_watching ? L"Состояние: ИДЁТ НАБЛЮДЕНИЕ\r\n" : L"Состояние: наблюдение не запущено\r\n");
-  if (g_watchStart[0]) { _snwprintf(tmp, 699, L"Начато: %ls\r\n", g_watchStart); wb_adds(&b, tmp); }
-  if (g_watching) { _snwprintf(tmp, 699, L"Областей слежения: %d\r\n", g_nwat); wb_adds(&b, tmp); }
-  _snwprintf(tmp, 699, L"Событий за сеанс: %lu\r\n", g_watchTotal);
+  wb_adds(&b, g_obs.running ? L"Состояние: ИДЁТ НАБЛЮДЕНИЕ\r\n" : L"Состояние: наблюдение не запущено\r\n");
+  if (g_obs.start[0]) { _snwprintf(tmp, 699, L"Начато: %ls\r\n", g_obs.start); wb_adds(&b, tmp); }
+  if (g_obs.running) { _snwprintf(tmp, 699, L"Областей слежения: %d\r\n", g_obs.n); wb_adds(&b, tmp); }
+  _snwprintf(tmp, 699, L"Событий за сеанс: %lu\r\n", g_obs.total);
   wb_adds(&b, tmp);
-  if (g_watchLog[0]) { wb_adds(&b, L"\r\nЛог наблюдения:\r\n"); wb_adds(&b, g_watchLog); wb_adds(&b, L"\r\n"); }
-  if (g_watching) {
+  if (g_obs.log[0]) { wb_adds(&b, L"\r\nЛог наблюдения:\r\n"); wb_adds(&b, g_obs.log); wb_adds(&b, L"\r\n"); }
+  if (g_obs.running) {
     wb_adds(&b, L"\r\nСлежу за:\r\n");
-    for (i = 0; i < g_nwat && i < 40; i++) { wb_adds(&b, g_wat[i].root); wb_adds(&b, g_wat[i].hkey ? L"\r\n" : L"   (нет доступа или ветки нет, повторяю попытки)\r\n"); }
-    if (g_nwat > 40) wb_adds(&b, L"...\r\n");
+    for (i = 0; i < g_obs.n && i < 40; i++) { wb_adds(&b, g_obs.w[i].root); wb_adds(&b, g_obs.w[i].hkey ? L"\r\n" : L"   (нет доступа или ветки нет, повторяю попытки)\r\n"); }
+    if (g_obs.n > 40) wb_adds(&b, L"...\r\n");
   } else {
     wb_adds(&b, L"\r\nКак пользоваться: нажмите «Начать наблюдение», выберите ветки (из закладок, целые разделы или свои). "
                 L"Затем изменяйте систему как обычно: каждое изменение в этих ветках появится в списке справа и в логе.\r\n\r\n"
@@ -4470,10 +5142,11 @@ static void WatchRefreshUI(void)
     wchar_t cnt[100];
     _snwprintf(cnt, 99, L"Событий в списке: %d", g_nwev);
     SetWindowTextW(g_hCount, cnt);
-    EnableWindow(g_hBtnJump, !g_watching);
-    EnableWindow(g_hBtnJumpNew, g_watching);
-    EnableWindow(g_hBtnX[1], g_watchLog[0] != 0);
+    EnableWindow(g_hBtnJump, !g_obs.running);
+    EnableWindow(g_hBtnJumpNew, g_obs.running);
+    EnableWindow(g_hBtnX[1], g_obs.log[0] != 0);
   }
+  if (g_tab == 4) ProtRefreshUI();
 }
 
 static LRESULT WatchLvNotify(NMHDR *nh, LPARAM lp)
@@ -4512,7 +5185,7 @@ static void ActWatchStart(void)
   SnapDlg d;
   Scope sc;
   int bad = 0;
-  if (g_watching) { MessageBoxW(g_hMain, L"Наблюдение уже идёт. Сначала остановите его.", APP_NAME, MB_ICONINFORMATION); return; }
+  if (g_obs.running) { MessageBoxW(g_hMain, L"Наблюдение уже идёт. Сначала остановите его.", APP_NAME, MB_ICONINFORMATION); return; }
   memset(&tl, 0, sizeof tl);
   CollectTargets(&tl);
   memset(&d, 0, sizeof d);
@@ -4538,7 +5211,7 @@ static void ActWatchStart(void)
                     L"Для точечного слежения выберите конкретные ветки.\n\nПродолжить?", APP_NAME, MB_YESNO | MB_ICONQUESTION) != IDYES) { ScFree(&sc); return; }
   }
   if (d.useExcl) LoadExclusions(&sc);
-  if (!WatchBegin(&sc, TRUE)) MessageBoxW(g_hMain, L"Наблюдение не запущено (отменено или нет доступных веток).", APP_NAME, MB_ICONINFORMATION);
+  if (!ObsBegin(&sc, TRUE, NULL, FALSE)) MessageBoxW(g_hMain, L"Наблюдение не запущено (отменено или нет доступных веток).", APP_NAME, MB_ICONINFORMATION);
   ScFree(&sc);
   SwitchTab(3);
   WatchViewRefresh();
@@ -4546,7 +5219,7 @@ static void ActWatchStart(void)
 
 static void ActWatchStop(void)
 {
-  if (!g_watching) return;
+  if (!g_obs.running) return;
   WatchStop();
   WatchViewRefresh();
 }
@@ -4554,33 +5227,841 @@ static void ActWatchStop(void)
 static void ActWatchOpenLog(void)
 {
   wchar_t arg[MAX_PATH + 24];
-  if (!g_watchLog[0]) return;
-  _snwprintf(arg, MAX_PATH + 23, L"\"%ls\"", g_watchLog);
+  if (!g_obs.log[0]) return;
+  _snwprintf(arg, MAX_PATH + 23, L"\"%ls\"", g_obs.log);
   ShellExecuteW(g_hMain, L"open", L"notepad.exe", arg, NULL, SW_SHOWNORMAL);
 }
 
-/* самопроверка из командной строки:
- *   /watch секунд ветка [ветка ...]   - наблюдать N секунд, события пишутся в Watch\watch_*.log */
-static int CliWatch(int argc, wchar_t **argv)
+/* ---- интерфейс вкладки «Защита» (держать от изменений) ---- */
+static void ProtGuiAppend(const wchar_t *line)
 {
+  int len;
+  if (!g_hProtLog) return;
+  len = GetWindowTextLengthW(g_hProtLog);
+  if (len > 1500000) { SetWindowTextW(g_hProtLog, L""); len = 0; }
+  SendMessageW(g_hProtLog, EM_SETSEL, len, len);
+  SendMessageW(g_hProtLog, EM_REPLACESEL, FALSE, (LPARAM)line);
+  SendMessageW(g_hProtLog, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
+}
+
+static void ActProtAdd(void)
+{
+  TargetList tl;
+  SnapDlg d;
   Scope sc;
-  int i, secs = _wtoi(argv[2]);
+  int i, bad = 0;
+  memset(&tl, 0, sizeof tl);
+  CollectTargets(&tl);
+  memset(&d, 0, sizeof d);
+  d.nBook = tl.n;
+  d.mode = 2;
+  if (!RunSnapDlg(&d)) { free(tl.t); free(d.manual); return; }
   memset(&sc, 0, sizeof sc);
-  for (i = 3; i < argc; i++) { wchar_t norm[2048]; if (NormalizeKey(argv[i], norm, 2048)) ScAddRoot(&sc, norm); }
-  ScNormalizeRoots(&sc);
-  if (!WatchBegin(&sc, FALSE)) return 1;
-  Sleep((DWORD)secs * 1000);
-  WatchStop();
+  if (d.useBook) for (i = 0; i < tl.n; i++) ScAddRoot(&sc, tl.t[i].path);
+  AddManualRoots(&sc, d.manual ? d.manual : L"", &bad);
+  free(d.manual);
+  free(tl.t);
+  if (sc.nroots == 0) MessageBoxW(g_hMain, bad ? L"Не удалось распознать ни одной ветки." : L"Не выбрано ни одной ветки.", APP_NAME, MB_ICONINFORMATION);
+  for (i = 0; i < sc.nroots; i++) ProtAddPath(sc.roots[i], d.useExcl);
   ScFree(&sc);
+}
+
+static void ActProtDel(void)
+{
+  int sel = -1, i, j;
+  BOOL *del = (BOOL *)calloc(g_npitems + 1, sizeof(BOOL));
+  while ((sel = ListView_GetNextItem(g_hProtLV, sel, LVNI_SELECTED)) >= 0) if (sel < g_npitems) del[sel] = TRUE;
+  for (i = 0, j = 0; i < g_npitems; i++) if (!del[i]) g_pitems[j++] = g_pitems[i];
+  if (j != g_npitems) { g_npitems = j; ProtSaveCfg(); ProtRefreshUI(); }
+  free(del);
+}
+
+static void ActProtToggle(void)
+{
+  if (g_prot.running) {
+    WatchStopSet(&g_prot);
+    ProtRefreshUI();
+    return;
+  }
+  if (g_npitems == 0) { MessageBoxW(g_hMain, L"Список пуст. Добавьте ветки кнопкой «Добавить…».", APP_NAME, MB_ICONINFORMATION); return; }
+  if (MessageBoxW(g_hMain, L"Исходным состоянием будет считаться ТЕКУЩЕЕ состояние выбранных веток. При любом изменении или удалении программа "
+                  L"вернёт его и запишет это в лог защиты.\n\nДля веток HKLM нужны права администратора (иначе вернуть не получится, "
+                  L"и это будет записано в лог).\n\nЗапустить защиту?", APP_NAME, MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+  if (!ProtBegin(g_pitems, g_npitems, TRUE, FALSE)) MessageBoxW(g_hMain, L"Защита не запущена (отменена или нет доступных веток).", APP_NAME, MB_ICONINFORMATION);
+  ProtRefreshUI();
+}
+
+static void ActProtOpenLog(void)
+{
+  wchar_t arg[MAX_PATH + 24];
+  _snwprintf(arg, MAX_PATH + 23, L"\"%ls\"", g_protLog);
+  ShellExecuteW(g_hMain, L"open", L"notepad.exe", arg, NULL, SW_SHOWNORMAL);
+}
+
+static void ActProtAutoToggle(void)
+{
+  g_protAuto = !g_protAuto;
+  ProtSaveCfg();
+  ProtRefreshUI();
+}
+
+/* ---- закладки без окна: модель для командной строки ---- */
+typedef struct { int depth; BOOL folder; wchar_t *name, *path, *comment; } BEnt;
+typedef struct { BEnt *e; int n, cap; } BModel;
+
+static void BmInsert(BModel *m, int at, int depth, BOOL folder, const wchar_t *name, const wchar_t *path, const wchar_t *comment)
+{
+  BEnt *e;
+  if (m->n == m->cap) { m->cap = m->cap ? m->cap * 2 : 32; m->e = (BEnt *)realloc(m->e, m->cap * sizeof(BEnt)); }
+  memmove(&m->e[at + 1], &m->e[at], (size_t)(m->n - at) * sizeof(BEnt));
+  e = &m->e[at];
+  e->depth = depth; e->folder = folder;
+  e->name = Dup(name); e->path = Dup(path); e->comment = Dup(comment);
+  m->n++;
+}
+
+static void BmFree(BModel *m)
+{
+  int i;
+  for (i = 0; i < m->n; i++) { free(m->e[i].name); free(m->e[i].path); free(m->e[i].comment); }
+  free(m->e);
+  memset(m, 0, sizeof *m);
+}
+
+static void BmParse(BModel *m, const wchar_t *text)
+{
+  const wchar_t *p = text;
+  while (*p) {
+    const wchar_t *eol = p, *f[5], *q, *fs;
+    size_t fl[5];
+    int nf = 0, i;
+    while (*eol && *eol != L'\n') eol++;
+    for (i = 0; i < 5; i++) { f[i] = NULL; fl[i] = 0; }
+    fs = p;
+    for (q = p; q <= eol; q++) {
+      if (q == eol || (*q == L'|' && nf < 4)) {
+        size_t l = (size_t)(q - fs);
+        if (l && fs[l - 1] == L'\r') l--;
+        f[nf] = fs; fl[nf] = l; nf++;
+        fs = q + 1;
+        if (q == eol) break;
+      }
+    }
+    if (nf >= 3 && fl[0] == 1 && (f[0][0] == L'F' || f[0][0] == L'K')) {
+      wchar_t dn[16], *name, *path, *cm;
+      size_t dl = fl[1] < 15 ? fl[1] : 15;
+      int depth;
+      wcsncpy(dn, f[1], dl); dn[dl] = 0;
+      depth = _wtoi(dn);
+      name = Unesc(f[2], fl[2]);
+      path = nf > 3 ? Unesc(f[3], fl[3]) : Dup(L"");
+      cm = nf > 4 ? Unesc(f[4], fl[4]) : Dup(L"");
+      BmInsert(m, m->n, depth, f[0][0] == L'F', name, path, cm);
+      free(name); free(path); free(cm);
+    }
+    p = *eol ? eol + 1 : eol;
+  }
+}
+
+static void BmText(BModel *m, WBuf *b)
+{
+  int i;
+  wchar_t num[16];
+  for (i = 0; i < m->n; i++) {
+    wb_addc(b, m->e[i].folder ? L'F' : L'K');
+    wb_addc(b, L'|');
+    _snwprintf(num, 15, L"%d", m->e[i].depth);
+    wb_adds(b, num);
+    wb_addc(b, L'|'); wb_esc(b, m->e[i].name);
+    wb_addc(b, L'|'); wb_esc(b, m->e[i].path);
+    wb_addc(b, L'|'); wb_esc(b, m->e[i].comment);
+    wb_adds(b, L"\r\n");
+  }
+}
+
+static int BmSubtreeEnd(BModel *m, int idx)
+{
+  int d, i;
+  if (idx < 0) return m->n;
+  d = m->e[idx].depth;
+  for (i = idx + 1; i < m->n && m->e[i].depth > d; i++) {}
+  return i;
+}
+
+static int BmFindChildFolder(BModel *m, int parent, const wchar_t *name)
+{
+  int i, end = BmSubtreeEnd(m, parent), start = parent < 0 ? 0 : parent + 1, depth = parent < 0 ? 0 : m->e[parent].depth + 1;
+  for (i = start; i < end; i++) if (m->e[i].depth == depth && m->e[i].folder && !_wcsicmp(m->e[i].name, name)) return i;
+  return -1;
+}
+
+/* найти или создать цепочку папок «A/B/C»; возвращает индекс последней папки (-1 - корень) */
+static int BmEnsureFolders(BModel *m, const wchar_t *folderPath)
+{
+  wchar_t buf[600], *tok;
+  int parent = -1;
+  if (!folderPath || !folderPath[0]) return -1;
+  wcsncpy(buf, folderPath, 599); buf[599] = 0;
+  for (tok = wcstok(buf, L"/\\"); tok; tok = wcstok(NULL, L"/\\")) {
+    int idx;
+    if (!tok[0]) continue;
+    idx = BmFindChildFolder(m, parent, tok);
+    if (idx < 0) {
+      int at = parent < 0 ? m->n : BmSubtreeEnd(m, parent);
+      BmInsert(m, at, parent < 0 ? 0 : m->e[parent].depth + 1, TRUE, tok, L"", L"");
+      idx = at;
+    }
+    parent = idx;
+  }
+  return parent;
+}
+
+static void BmAddKey(BModel *m, const wchar_t *folderPath, const wchar_t *name, const wchar_t *path, const wchar_t *comment)
+{
+  int parent = BmEnsureFolders(m, folderPath);
+  int at = parent < 0 ? m->n : BmSubtreeEnd(m, parent);
+  BmInsert(m, at, parent < 0 ? 0 : m->e[parent].depth + 1, FALSE, name, path, comment);
+}
+
+static void BmLoad(BModel *m) { memset(m, 0, sizeof *m); BmParse(m, g_cfgBook ? g_cfgBook : L""); }
+
+static BOOL BmSave(BModel *m)
+{
+  WBuf b = { 0 };
+  BOOL ok;
+  BmText(m, &b);
+  ok = SaveConfigWith(b.p ? b.p : L"", TRUE);
+  free(b.p);
+  return ok;
+}
+
+/* добавление закладки в запущенном окне (команда передаётся из командной строки) */
+static HTREEITEM FindChildFolderGui(HTREEITEM parent, const wchar_t *name)
+{
+  HTREEITEM it;
+  wchar_t t[300];
+  for (it = FirstChild(parent); it; it = TreeView_GetNextSibling(g_hTree, it)) {
+    NodeData *nd = GetNode(it);
+    if (!nd || !nd->folder) continue;
+    GetItemTextW2(it, t, 300);
+    if (!_wcsicmp(t, name)) return it;
+  }
+  return NULL;
+}
+
+static void GuiAddBookmark(const wchar_t *key, const wchar_t *name, const wchar_t *folder)
+{
+  HTREEITEM parent = TVI_ROOT, it;
+  wchar_t buf[600], *tok, nm[300], cm[200], ts[32];
+  const wchar_t *sl = wcsrchr(key, L'\\');
+  CommitEdits();
+  if (folder && folder[0]) {
+    wcsncpy(buf, folder, 599); buf[599] = 0;
+    for (tok = wcstok(buf, L"/\\"); tok; tok = wcstok(NULL, L"/\\")) {
+      HTREEITEM f = FindChildFolderGui(parent, tok);
+      if (!f) f = InsertNode(parent, TVI_LAST, tok, TRUE, L"", L"");
+      parent = f;
+    }
+  }
+  wcsncpy(nm, name && name[0] ? name : (sl ? sl + 1 : key), 255); nm[255] = 0;
+  NowStr(ts, 32);
+  _snwprintf(cm, 199, L"Добавлено из командной строки: %ls", ts);
+  it = InsertNode(parent, TVI_LAST, nm, FALSE, key, cm);
+  if (parent != TVI_ROOT) TreeView_Expand(g_hTree, parent, TVE_EXPAND);
+  (void)it;
+  MarkDirty();
+}
+
+/* ====================================================================
+ *  команды командной строки (без окна)
+ * ==================================================================== */
+static int UsageErr(const wchar_t *msg)
+{
+  ConPrint(L"Ошибка: %ls\nСправка: KeyShelfRegJumper.exe /?\n", msg);
+  return 2;
+}
+
+static void CliSplit(TargetList *tl, wchar_t **others, int *nother)
+{
+  int i;
+  *nother = 0;
+  for (i = 0; i < g_cli.npos; i++) {
+    wchar_t norm[2048];
+    if (NormalizeKey(g_cli.pos[i], norm, 2048)) tl_add(tl, norm);
+    else others[(*nother)++] = g_cli.pos[i];
+  }
+}
+
+static BOOL IsGuiRunning(void) { return FindWindowW(CLS_MAIN, NULL) != NULL; }
+
+static int CliJumpKey(const wchar_t *key, BOOL newWin)
+{
+  JumpReq *r = (JumpReq *)calloc(1, sizeof *r);
+  wchar_t norm[2048];
+  if (!NormalizeKey(key, norm, 2048)) { free(r); return UsageErr(L"не удалось распознать ветку реестра."); }
+  wcscpy(r->path, norm);
+  r->newWin = newWin;
+  if (!g_jumpMutex) g_jumpMutex = CreateMutexW(NULL, FALSE, NULL);
+  ConPrint(L"Открываю regedit на ветке %ls (%ls)...\n", norm, newWin ? L"новое окно /m" : L"обычный режим");
+  JumpThread(r);
+  if (g_jumpRc == 0) { ConPrint(L"Готово.\n"); return 0; }
+  ConPrint(L"Не удалось открыть regedit (код %d). Подробности в логе.\n", g_jumpRc);
+  return 1;
+}
+
+static void PrintBookmarks(BModel *m)
+{
+  int i;
+  for (i = 0; i < m->n; i++) {
+    wchar_t indent[80];
+    int k, pos = 0;
+    for (k = 0; k < m->e[i].depth * 2 && pos < 70; k++) indent[pos++] = L' ';
+    indent[pos] = 0;
+    if (m->e[i].folder) ConPrint(L"%ls%ls/\n", indent, m->e[i].name);
+    else ConPrint(L"%ls%ls  ->  %ls%ls%ls\n", indent, m->e[i].name, m->e[i].path, m->e[i].comment[0] ? L"   # " : L"", m->e[i].comment);
+  }
+  if (m->n == 0) ConPrint(L"Закладок нет.\n");
+}
+
+static int CliAdd(void)
+{
+  TargetList tl;
+  wchar_t *others[64], cm[200], ts[32], nm[300];
+  int nother, rc = 0;
+  BModel m;
+  memset(&tl, 0, sizeof tl);
+  CliSplit(&tl, others, &nother);
+  if (tl.n < 1) { free(tl.t); return UsageErr(L"/add: укажите ветку реестра."); }
+  NowStr(ts, 32);
+  _snwprintf(cm, 199, L"Добавлено из командной строки: %ls", ts);
+  if (IsGuiRunning()) {
+    HWND w = FindWindowW(CLS_MAIN, NULL);
+    wchar_t pl[3000];
+    COPYDATASTRUCT cd;
+    _snwprintf(pl, 2999, L"%ls\x01%ls\x01%ls", tl.t[0].path, nother > 0 ? others[0] : L"", nother > 1 ? others[1] : L"");
+    pl[2999] = 0;
+    cd.dwData = 2; cd.cbData = (DWORD)((wcslen(pl) + 1) * sizeof(wchar_t)); cd.lpData = pl;
+    AllowSetForegroundWindow(ASFW_ANY);
+    SendMessageW(w, WM_COPYDATA, 0, (LPARAM)&cd);
+    ConPrint(L"Закладка передана в открытое окно программы: %ls\n", tl.t[0].path);
+    free(tl.t);
+    return 0;
+  }
+  {
+    const wchar_t *sl = wcsrchr(tl.t[0].path, L'\\');
+    wcsncpy(nm, nother > 0 && others[0][0] ? others[0] : (sl ? sl + 1 : tl.t[0].path), 255);
+    nm[255] = 0;
+  }
+  BmLoad(&m);
+  BmAddKey(&m, nother > 1 ? others[1] : L"", nm, tl.t[0].path, cm);
+  if (BmSave(&m)) ConPrint(L"Закладка добавлена: %ls  ->  %ls\n", nm, tl.t[0].path);
+  else { ConPrint(L"Не удалось записать конфигурацию %ls\n", g_cfgFile); rc = 1; }
+  BmFree(&m);
+  free(tl.t);
+  return rc;
+}
+
+static int CliGoto(void)
+{
+  BModel m;
+  int i, found = -1, rc;
+  wchar_t norm[2048];
+  if (g_cli.npos < 1) return UsageErr(L"/goto: укажите имя закладки или путь.");
+  BmLoad(&m);
+  for (i = 0; i < m.n && found < 0; i++) if (!m.e[i].folder && !_wcsicmp(m.e[i].name, g_cli.pos[0])) found = i;
+  if (found < 0 && NormalizeKey(g_cli.pos[0], norm, 2048)) {
+    for (i = 0; i < m.n && found < 0; i++) if (!m.e[i].folder && !_wcsicmp(m.e[i].path, norm)) found = i;
+  }
+  if (found < 0) {
+    for (i = 0; i < m.n && found < 0; i++) if (!m.e[i].folder && StrStrIW(m.e[i].name, g_cli.pos[0])) found = i;
+  }
+  if (found < 0) { ConPrint(L"Закладка не найдена: %ls\n", g_cli.pos[0]); BmFree(&m); return 3; }
+  ConPrint(L"Закладка: %ls\n", m.e[found].name);
+  rc = CliJumpKey(m.e[found].path, g_cli.newWin);
+  BmFree(&m);
+  return rc;
+}
+
+static int CliList(void)
+{
+  BModel m;
+  BmLoad(&m);
+  PrintBookmarks(&m);
+  BmFree(&m);
   return 0;
 }
 
-static int CliProbe(void)
+static void EnsureParentDir(const wchar_t *file)
+{
+  wchar_t d[MAX_PATH + 8], *sl;
+  wcsncpy(d, file, MAX_PATH + 7); d[MAX_PATH + 7] = 0;
+  sl = wcsrchr(d, L'\\');
+  if (sl && sl > d) { *sl = 0; EnsureDir(d); }
+}
+
+/* выгрузка нескольких веток в один файл */
+static int ExportKeysToFile(TargetList *tl, const wchar_t *file, wchar_t *msg, size_t cap)
+{
+  EnsureParentDir(file);
+  if (tl->n == 1) return RunRegExport(tl->t[0].path, file, msg, cap);
+  {
+    WBuf all = { 0 };
+    wchar_t tmp[MAX_PATH + 40], tdir[MAX_PATH], *text;
+    int i, ok = 0, rc = 0;
+    GetTempPathW(MAX_PATH, tdir);
+    for (i = 0; i < tl->n; i++) {
+      wchar_t em[400];
+      SetBusy(L"Экспорт %d из %d: %ls", i + 1, tl->n, tl->t[i].path);
+      _snwprintf(tmp, MAX_PATH + 39, L"%lskeyshelf_%lu_%d.reg", tdir, GetTickCount(), i);
+      if (RunRegExport(tl->t[i].path, tmp, em, 400) == 0) { AppendRegBody(&all, tmp); ok++; }
+      else { rc = 1; _snwprintf(msg, cap - 1, L"%ls: %ls", tl->t[i].path, em); }
+      DeleteFileW(tmp);
+    }
+    if (ok == 0) { free(all.p); return rc ? rc : 1; }
+    text = (wchar_t *)malloc(((all.p ? wcslen(all.p) : 0) + 64) * sizeof(wchar_t));
+    wcscpy(text, L"Windows Registry Editor Version 5.00\r\n\r\n");
+    if (all.p) wcscat(text, all.p);
+    if (!WriteUtf16File(file, text)) rc = 1;
+    free(text); free(all.p);
+    return rc;
+  }
+}
+
+static int CliExport(void)
+{
+  TargetList tl;
+  wchar_t *others[64], msg[500];
+  int nother, rc;
+  memset(&tl, 0, sizeof tl);
+  CliSplit(&tl, others, &nother);
+  if (tl.n < 1 || nother < 1) { free(tl.t); return UsageErr(L"/export: укажите ветку (или несколько) и имя файла .reg."); }
+  msg[0] = 0;
+  g_conProgress = g_conIsConsole;
+  rc = ExportKeysToFile(&tl, others[0], msg, 500);
+  ConProgressEnd();
+  if (rc == 0) ConPrint(L"Сохранено: %ls (веток: %d)\n", others[0], tl.n);
+  else ConPrint(L"Не удалось выгрузить: %ls\n", msg);
+  free(tl.t);
+  return rc == 0 ? 0 : 1;
+}
+
+static int CliSaveTo(void)
+{
+  TargetList tl;
+  wchar_t *others[64];
+  int nother, rc;
+  SaveJob *job;
+  memset(&tl, 0, sizeof tl);
+  CliSplit(&tl, others, &nother);
+  if (tl.n < 1) { free(tl.t); return UsageErr(L"/saveto: укажите ветку (и, при желании, заметку)."); }
+  EnsureDir(g_savedDir);
+  job = (SaveJob *)calloc(1, sizeof *job);
+  job->tl = &tl;
+  wcsncpy(job->dir, g_savedDir, MAX_PATH - 1);
+  MakeTimestamp(job->ts, 32);
+  if (nother > 0) wcsncpy(job->note, others[0], 199);
+  job->useTag = TRUE;
+  g_conProgress = g_conIsConsole;
+  InterlockedExchange(&g_cancel, 0);
+  SaveWorker(job);
+  ConProgressEnd();
+  rc = job->fail == 0 ? 0 : 1;
+  if (job->ok > 0) ConPrint(L"Сохранено файлов: %d. %ls%ls\n", job->ok, tl.n == 1 ? L"Файл: " : L"Первый файл: ", job->firstFile);
+  if (job->fail > 0) ConPrint(L"Не удалось: %d.\n%ls\n", job->fail, job->firstErr);
+  free(job);
+  free(tl.t);
+  return rc;
+}
+
+static int CliScript(BOOL vbs)
+{
+  TargetList tl;
+  wchar_t *others[64], dir[MAX_PATH];
+  int nother, i, mode = 1, made = 0, failed = 0;
+  memset(&tl, 0, sizeof tl);
+  CliSplit(&tl, others, &nother);
+  if (tl.n < 1) { free(tl.t); return UsageErr(vbs ? L"/vbs: укажите ветку." : L"/bat: укажите ветку."); }
+  wcsncpy(dir, g_batDir, MAX_PATH - 1); dir[MAX_PATH - 1] = 0;
+  for (i = 0; i < nother; i++) {
+    if (!_wcsicmp(others[i], L"NO") || !_wcsicmp(others[i], L"normal")) mode = 0;
+    else if (!_wcsicmp(others[i], L"NW") || !_wcsicmp(others[i], L"new")) mode = 1;
+    else if (!_wcsicmp(others[i], L"BOTH") || !_wcsicmp(others[i], L"all")) mode = 2;
+    else { wcsncpy(dir, others[i], MAX_PATH - 1); dir[MAX_PATH - 1] = 0; }
+  }
+  if (!EnsureDir(dir)) { free(tl.t); ConPrint(L"Не удалось создать папку: %ls\n", dir); return 1; }
+  for (i = 0; i < tl.n; i++) {
+    int md;
+    for (md = 0; md < 2; md++) {
+      wchar_t name[400], full[MAX_PATH + 16], *text;
+      BOOL nw = (md == 1);
+      BOOL ok;
+      if (mode == 0 && nw) continue;
+      if (mode == 1 && !nw) continue;
+      MakeBatName(name, 400, 250 - (int)wcslen(dir) - 1 - 4, nw, tl.t[i].path);
+      _snwprintf(full, MAX_PATH + 15, L"%ls\\%ls", dir, name);
+      if (vbs) {
+        wcscpy(full + wcslen(full) - 4, L".vbs");
+        text = BuildVbs(tl.t[i].path, nw);
+        ok = text && WriteUtf16File(full, text);
+      } else {
+        text = BuildBat(tl.t[i].path, nw);
+        ok = text && WriteUtf8File(full, text);
+      }
+      free(text);
+      if (ok) { made++; ConPrint(L"Создан: %ls\n", full); } else { failed++; ConPrint(L"Не удалось создать: %ls\n", full); }
+    }
+  }
+  free(tl.t);
+  return failed ? 1 : 0;
+}
+
+/* ---- снимки ---- */
+static void SnapEnumToArray(void)
+{
+  WIN32_FIND_DATAW fd;
+  HANDLE h;
+  wchar_t pat[MAX_PATH + 8], full[MAX_PATH + 24];
+  int cap = 0;
+  free(g_snaps);
+  g_snaps = NULL;
+  g_nsnaps = 0;
+  _snwprintf(pat, MAX_PATH + 7, L"%ls\\*.ksn", g_snapDir);
+  h = FindFirstFileW(pat, &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      SnapInfo si;
+      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+      _snwprintf(full, MAX_PATH + 23, L"%ls\\%ls", g_snapDir, fd.cFileName);
+      if (!ReadSnapInfo(full, &si)) continue;
+      if (g_nsnaps == cap) { cap = cap ? cap * 2 : 32; g_snaps = (SnapInfo *)realloc(g_snaps, cap * sizeof(SnapInfo)); }
+      g_snaps[g_nsnaps++] = si;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  if (g_nsnaps > 1) qsort(g_snaps, g_nsnaps, sizeof(SnapInfo), QsCmpSnap);
+}
+
+/* снимок можно задать путём, именем файла в Snapshots или частью названия (берётся самый свежий) */
+static BOOL ResolveSnap(const wchar_t *arg, wchar_t *out)
+{
+  wchar_t t[MAX_PATH + 24];
+  int i;
+  DWORD a = GetFileAttributesW(arg);
+  if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) { wcsncpy(out, arg, MAX_PATH + 15); out[MAX_PATH + 15] = 0; return TRUE; }
+  _snwprintf(t, MAX_PATH + 23, L"%ls\\%ls", g_snapDir, arg);
+  a = GetFileAttributesW(t);
+  if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) { wcsncpy(out, t, MAX_PATH + 15); out[MAX_PATH + 15] = 0; return TRUE; }
+  _snwprintf(t, MAX_PATH + 23, L"%ls\\%ls.ksn", g_snapDir, arg);
+  a = GetFileAttributesW(t);
+  if (a != INVALID_FILE_ATTRIBUTES) { wcsncpy(out, t, MAX_PATH + 15); out[MAX_PATH + 15] = 0; return TRUE; }
+  SnapEnumToArray();
+  for (i = g_nsnaps - 1; i >= 0; i--) {
+    if (StrStrIW(g_snaps[i].name, arg) || StrStrIW(PathFindFileNameW(g_snaps[i].file), arg)) { wcscpy(out, g_snaps[i].file); return TRUE; }
+  }
+  return FALSE;
+}
+
+static int CliSnapCmd(void)
+{
+  ScanJob *sj;
+  int i, bad = 0;
+  wchar_t *file = NULL, *name = NULL;
+  if (g_cli.npos < 3) return UsageErr(L"/snap: нужны файл снимка, название и хотя бы одна ветка.");
+  file = g_cli.pos[0]; name = g_cli.pos[1];
+  sj = (ScanJob *)calloc(1, sizeof *sj);
+  for (i = 2; i < g_cli.npos; i++) {
+    wchar_t norm[2048];
+    if (NormalizeKey(g_cli.pos[i], norm, 2048)) ScAddRoot(&sj->scope, norm); else bad++;
+  }
+  ScNormalizeRoots(&sj->scope);
+  if (sj->scope.nroots == 0) { ScFree(&sj->scope); free(sj); return UsageErr(L"/snap: не удалось распознать ни одной ветки."); }
+  if (g_cli.excl) LoadExclusions(&sj->scope);
+  if (!wcschr(file, L'\\') && !wcschr(file, L'/') && !wcschr(file, L':')) {
+    EnsureDir(g_snapDir);
+    _snwprintf(sj->file, MAX_PATH + 15, L"%ls\\%ls%ls", g_snapDir, file, wcsrchr(file, L'.') ? L"" : L".ksn");
+  } else { wcsncpy(sj->file, file, MAX_PATH + 15); EnsureParentDir(sj->file); }
+  wcsncpy(sj->name, name, 199);
+  g_conProgress = g_conIsConsole;
+  InterlockedExchange(&g_cancel, 0);
+  DoScanToFile(sj);
+  ConProgressEnd();
+  if (sj->ok) { ConPrint(L"Снимок готов: %ls\nНазвание: %ls\nДата и время: %ls\nВеток: %lu, значений: %lu, без доступа: %lu\n", sj->file, sj->name, sj->start, sj->keys, sj->vals, sj->errs); if (bad) ConPrint(L"Нераспознанных веток пропущено: %d\n", bad); }
+  else ConPrint(L"%ls\n", sj->canceled ? L"Снимок отменён." : L"Не удалось создать снимок.");
+  i = sj->ok ? 0 : 1;
+  ScFree(&sj->scope);
+  free(sj);
+  return i;
+}
+
+static int CliSnapsList(void)
+{
+  int i;
+  SnapEnumToArray();
+  if (g_nsnaps == 0) { ConPrint(L"Снимков нет (папка %ls).\n", g_snapDir); return 0; }
+  for (i = 0; i < g_nsnaps; i++)
+    ConPrint(L"%ls  %-30ls веток %lu, значений %lu%ls\n  %ls\n", g_snaps[i].start, g_snaps[i].name, g_snaps[i].keys, g_snaps[i].vals, g_snaps[i].complete ? L"" : L"  (не завершён)", g_snaps[i].file);
+  return 0;
+}
+
+static int CliCmpCmd(void)
+{
+  CmpJob *j;
+  wchar_t a[MAX_PATH + 16], b[MAX_PATH + 16], ts[32], when[32], rp[MAX_PATH + 16];
+  BOOL cur;
+  if (g_cli.npos < 2) return UsageErr(L"/cmp: укажите два снимка (или снимок и current) и, при желании, файл отчёта.");
+  if (!ResolveSnap(g_cli.pos[0], a)) { ConPrint(L"Снимок не найден: %ls\n", g_cli.pos[0]); return 3; }
+  cur = !_wcsicmp(g_cli.pos[1], L"current");
+  if (!cur && !ResolveSnap(g_cli.pos[1], b)) { ConPrint(L"Снимок не найден: %ls\n", g_cli.pos[1]); return 3; }
+  j = (CmpJob *)calloc(1, sizeof *j);
+  wcscpy(j->fileA, a);
+  if (cur) {
+    j->vsCurrent = TRUE;
+    EnsureDir(g_snapDir);
+    _snwprintf(j->tmpFile, MAX_PATH + 15, L"%ls\\_current.tmp", g_snapDir);
+    wcscpy(j->curName, L"Текущее состояние реестра");
+    wcscpy(g_cmpB, L"Текущее состояние реестра");
+  } else wcscpy(j->fileB, b);
+  g_conProgress = g_conIsConsole;
+  InterlockedExchange(&g_cancel, 0);
+  FreeDiff();
+  CompareWorker(j);
+  ConProgressEnd();
+  if (j->vsCurrent) DeleteFileW(j->tmpFile);
+  if (j->result != 1) { ConPrint(L"%ls\n", j->result == 2 ? L"Сравнение отменено." : (j->err[0] ? j->err : L"Не удалось выполнить сравнение.")); free(j); return 1; }
+  NowStr(when, 32);
+  wcscpy(g_cmpWhen, when);
+  BuildSummary(g_cmpSummary, 900);
+  if (g_cli.npos >= 3) wcsncpy(rp, g_cli.pos[2], MAX_PATH + 15);
+  else {
+    wchar_t nm2[600];
+    EnsureDir(g_repDir);
+    MakeTimestamp(ts, 32);
+    MakeRegName(nm2, 600, 150, ts, L"сравнение", L"");
+    _snwprintf(rp, MAX_PATH + 15, L"%ls\\%ls.txt", g_repDir, nm2);
+    UniquePath(rp, MAX_PATH + 16);
+  }
+  EnsureParentDir(rp);
+  ConPrint(L"Было:  %ls (%ls)\nСтало: %ls (%ls)\n%ls\n", g_cmpA, g_cmpTimeA, g_cmpB, g_cmpTimeB, g_cmpSummary);
+  if (WriteReport(rp)) ConPrint(L"Отчёт: %ls\n", rp);
+  else { ConPrint(L"Не удалось записать отчёт: %ls\n", rp); free(j); return 1; }
+  free(j);
+  return 0;
+}
+
+/* ---- наблюдение и защита в консоли ---- */
+static void CliWait(int secs)
+{
+  DWORD t0 = GetTickCount();
+  SetConsoleCtrlHandler(CtrlHandler, TRUE);
+  while (!g_ctrlc) {
+    Sleep(200);
+    if (secs > 0 && GetTickCount() - t0 >= (DWORD)secs * 1000) break;
+  }
+}
+
+static int CliWatchCmd(void)
+{
+  Scope sc;
+  int i, secs = 0, first = 0;
+  memset(&sc, 0, sizeof sc);
+  if (g_cli.npos > 0) {
+    BOOL num = g_cli.pos[0][0] != 0;
+    const wchar_t *c;
+    for (c = g_cli.pos[0]; *c; c++) if (*c < L'0' || *c > L'9') num = FALSE;
+    if (num) { secs = _wtoi(g_cli.pos[0]); first = 1; }
+  }
+  for (i = first; i < g_cli.npos; i++) { wchar_t norm[2048]; if (NormalizeKey(g_cli.pos[i], norm, 2048)) ScAddRoot(&sc, norm); }
+  ScNormalizeRoots(&sc);
+  if (sc.nroots == 0) { ScFree(&sc); return UsageErr(L"/watch: укажите хотя бы одну ветку."); }
+  if (g_cli.excl) LoadExclusions(&sc);
+  g_conProgress = g_conIsConsole;
+  SetConsoleCtrlHandler(CtrlHandler, TRUE);
+  if (!ObsBegin(&sc, FALSE, g_cli.out[0] ? g_cli.out : NULL, TRUE)) { ConProgressEnd(); ConPrint(L"Наблюдение не запущено.\n"); ScFree(&sc); return 1; }
+  ConProgressEnd();
+  ScFree(&sc);
+  ConPrint(L"Наблюдение запущено (областей: %d). %ls\nЛог: %ls\n\n", g_obs.n, secs > 0 ? L"Остановится само." : L"Остановить: Ctrl+C.", g_obs.log);
+  CliWait(secs);
+  WatchStop();
+  ConPrint(L"Наблюдение остановлено. Событий: %lu\n", g_obs.total);
+  return 0;
+}
+
+static int CliHoldCmd(void)
+{
+  TargetList tl;
+  wchar_t *others[64];
+  int nother, i, n = 0, rc;
+  ProtItem *items;
+  int secs = 0;
+  memset(&tl, 0, sizeof tl);
+  CliSplit(&tl, others, &nother);
+  if (nother > 0) {
+    const wchar_t *c;
+    BOOL num = others[0][0] != 0;
+    for (c = others[0]; *c; c++) if (*c < L'0' || *c > L'9') num = FALSE;
+    if (num) secs = _wtoi(others[0]);
+  }
+  items = (ProtItem *)calloc((tl.n > 0 ? tl.n : (g_npitems > 0 ? g_npitems : 1)) + 1, sizeof(ProtItem));
+  if (tl.n > 0) {
+    for (i = 0; i < tl.n; i++) { wcscpy(items[n].path, tl.t[i].path); items[n].rec = !g_cli.norec; n++; }
+  } else {
+    for (i = 0; i < g_npitems; i++) items[n++] = g_pitems[i];
+  }
+  free(tl.t);
+  if (n == 0) { free(items); return UsageErr(L"/hold: укажите ветки или добавьте их в список защиты в программе."); }
+  g_conProgress = g_conIsConsole;
+  SetConsoleCtrlHandler(CtrlHandler, TRUE);
+  if (!ProtBegin(items, n, FALSE, TRUE)) { ConProgressEnd(); ConPrint(L"Защита не запущена.\n"); free(items); return 1; }
+  ConProgressEnd();
+  ConPrint(L"Защита от изменений включена (веток: %d). %ls\nЛог: %ls\nДля веток HKLM нужны права администратора.\n\n", g_prot.n, secs > 0 ? L"Остановится само." : L"Остановить: Ctrl+C.", g_protLog);
+  CliWait(secs);
+  WatchStopSet(&g_prot);
+  ConPrint(L"Защита остановлена. Событий: %lu\n", g_prot.total);
+  free(items);
+  rc = 0;
+  return rc;
+}
+
+/* ---- правка в редакторе, импорт, очистка ---- */
+static int CliOpenCmd(int kind)
+{
+  TargetList tl;
+  wchar_t *others[64], editF[MAX_PATH + 16], origF[MAX_PATH + 16], err[300], exe[MAX_PATH] = L"";
+  int nother;
+  HANDLE hp = NULL;
+  memset(&tl, 0, sizeof tl);
+  CliSplit(&tl, others, &nother);
+  if (kind == 1) {
+    if (nother < 1) { free(tl.t); return UsageErr(L"/open-with: укажите путь к редактору и ветку."); }
+    wcsncpy(exe, others[0], MAX_PATH - 1);
+  }
+  if (tl.n < 1) { free(tl.t); return UsageErr(L"/open: укажите ветку."); }
+  g_conProgress = g_conIsConsole;
+  if (!EditExport(&tl, FALSE, editF, origF, err)) { ConProgressEnd(); ConPrint(L"Не удалось выгрузить ветку: %ls\n", err); free(tl.t); return 1; }
+  ConProgressEnd();
+  free(tl.t);
+  ConPrint(L"Файл для правки: %ls\nОригинал (не меняется): %ls\n", editF, origF);
+  if (!LaunchEditor(kind, exe, editF, &hp)) { ConPrint(L"Не удалось запустить редактор.\n"); return 1; }
+  if (g_cli.apply) {
+    if (!hp) { ConPrint(L"Редактор не позволяет дождаться закрытия. Внести правки позже: /import \"%ls\"\n", editF); return 0; }
+    ConPrint(L"Жду закрытия редактора...\n");
+    WaitForSingleObject(hp, INFINITE);
+    CloseHandle(hp);
+    if (ConAsk(L"Внести изменённый файл в реестр?")) {
+      wchar_t em[500];
+      int rc = RunRegImport(editF, em, 500);
+      if (rc == 0) ConPrint(L"Внесено в реестр. Оригинал для отката: %ls\n", origF);
+      else { ConPrint(L"Не удалось внести (код %d): %ls\nНужны права администратора?\n", rc, em); return 1; }
+    } else ConPrint(L"Не внесено. Позже: /import \"%ls\"\n", editF);
+  } else {
+    if (hp) CloseHandle(hp);
+    ConPrint(L"Внести правки в реестр после редактирования: /import \"%ls\"\nОткатить к оригиналу: /import \"%ls\"\n", editF, origF);
+  }
+  return 0;
+}
+
+static int CliImportCmd(void)
+{
+  wchar_t em[500];
+  int rc;
+  if (g_cli.npos < 1) return UsageErr(L"/import: укажите .reg-файл.");
+  if (GetFileAttributesW(g_cli.pos[0]) == INVALID_FILE_ATTRIBUTES) { ConPrint(L"Файл не найден: %ls\n", g_cli.pos[0]); return 3; }
+  {
+    wchar_t q[MAX_PATH + 80];
+    _snwprintf(q, MAX_PATH + 79, L"Внести %ls в реестр? Значения в указанных ветках изменятся или будут созданы.", g_cli.pos[0]);
+    if (!ConAsk(q)) { ConPrint(L"Отменено.\n"); return 1; }
+  }
+  rc = RunRegImport(g_cli.pos[0], em, 500);
+  if (rc == 0) { ConPrint(L"Внесено в реестр.\n"); return 0; }
+  ConPrint(L"Не удалось внести (код %d): %ls\n", rc, em);
+  return 1;
+}
+
+static int CliLogCmd(void)
+{
+  BOOL on;
+  if (g_cli.npos < 1) return UsageErr(L"/log: укажите on или off.");
+  if (!_wcsicmp(g_cli.pos[0], L"on") || !_wcsicmp(g_cli.pos[0], L"1")) on = TRUE;
+  else if (!_wcsicmp(g_cli.pos[0], L"off") || !_wcsicmp(g_cli.pos[0], L"0")) on = FALSE;
+  else return UsageErr(L"/log: допустимые значения on и off.");
+  if (IsGuiRunning()) { ConPrint(L"Программа открыта в окне: измените лог в «Настройки», иначе при закрытии окна настройка перезапишется.\n"); return 1; }
+  CfgSet(L"Options", L"LogEnabled", on ? L"1" : L"0");
+  if (!SaveConfigWith(g_cfgBook ? g_cfgBook : L"", g_cfgHasBook)) { ConPrint(L"Не удалось записать конфигурацию.\n"); return 1; }
+  ConPrint(L"Лог %ls.\n", on ? L"включён" : L"выключен");
+  return 0;
+}
+
+static int CliAddRegCmd(void)
+{
+  int f, rc = 0;
+  BModel m;
+  if (g_cli.npos < 1) return UsageErr(L"/addreg: укажите .reg-файл.");
+  if (IsGuiRunning()) { ConPrint(L"Программа открыта в окне: используйте /addreg без /nogui или закройте окно.\n"); return 1; }
+  BmLoad(&m);
+  for (f = 0; f < g_cli.npos; f++) {
+    KeyList kl;
+    wchar_t folder[300], cm[300];
+    int i;
+    memset(&kl, 0, sizeof kl);
+    if (!ParseRegFile(g_cli.pos[f], &kl) || kl.n == 0) { ConPrint(L"В файле нет веток: %ls\n", g_cli.pos[f]); kl_free(&kl); rc = 1; continue; }
+    wcsncpy(folder, PathFindFileNameW(g_cli.pos[f]), 299); folder[299] = 0;
+    _snwprintf(cm, 299, L"Из файла: %ls", folder);
+    PathRemoveExtensionW(folder);
+    for (i = 0; i < kl.n; i++) {
+      wchar_t *sl = wcsrchr(kl.keys[i], L'\\');
+      BmAddKey(&m, folder, sl ? sl + 1 : kl.keys[i], kl.keys[i], cm);
+    }
+    ConPrint(L"Из %ls добавлено веток: %d (папка «%ls»)\n", g_cli.pos[f], kl.n, folder);
+    kl_free(&kl);
+  }
+  if (!BmSave(&m)) { ConPrint(L"Не удалось записать конфигурацию.\n"); rc = 1; }
+  BmFree(&m);
+  return rc;
+}
+
+static int CliProbeCmd(void)
 {
   wchar_t path[2048];
   int r = GetRegeditKey(path);
-  if (r == 0) Log(L"PROBE: ветка из regedit = %ls", path); else Log(L"PROBE: не удалось (код %d)", r);
+  if (r == 0) { ConPrint(L"Ветка в regedit: %ls\n", path); return 0; }
+  ConPrint(L"%ls\n", r == 1 ? L"regedit не запущен." : L"Не удалось прочитать ветку из окна regedit (возможно, он запущен от администратора). Подробности в логе.");
   return r;
+}
+
+/* главный диспетчер консольных команд */
+static int RunCli(void)
+{
+  if (g_cli.bad) { wchar_t m[300]; _snwprintf(m, 299, L"неизвестный или конфликтующий ключ: %ls", g_cli.badArg); return UsageErr(m); }
+  if (g_cli.cmd == C_NONE) { ShowHelp(); return 1; }
+  switch (g_cli.cmd) {
+    case C_HELP: ShowHelp(); return 0;
+    case C_VERSION: ConPrint(L"Key Shelf Reg Jumper %ls\n", APP_VER); return 0;
+    case C_JUMP: case C_JUMPM:
+      if (g_cli.npos < 1) return UsageErr(L"укажите ветку реестра.");
+      return CliJumpKey(g_cli.pos[0], g_cli.cmd == C_JUMPM);
+    case C_ADD: return CliAdd();
+    case C_GOTO: return CliGoto();
+    case C_LIST: return CliList();
+    case C_EXPORT: return CliExport();
+    case C_SAVETO: return CliSaveTo();
+    case C_BAT: return CliScript(FALSE);
+    case C_VBS: return CliScript(TRUE);
+    case C_SNAP: return CliSnapCmd();
+    case C_CMP: return CliCmpCmd();
+    case C_SNAPS: return CliSnapsList();
+    case C_WATCH: return CliWatchCmd();
+    case C_HOLD: return CliHoldCmd();
+    case C_OPEN: return CliOpenCmd(0);
+    case C_OPENNP: return CliOpenCmd(2);
+    case C_OPENWITH: return CliOpenCmd(1);
+    case C_IMPORT: return CliImportCmd();
+    case C_CLEANTMP: ClearTmpDir(); ConPrint(L"Временная папка очищена: %ls\n", g_tmpDir); return 0;
+    case C_LOG: return CliLogCmd();
+    case C_ADDREG: return CliAddRegCmd();
+    case C_PROBE: return CliProbeCmd();
+    default: break;
+  }
+  return 2;
 }
 
 /* ---- главное окно ---- */
@@ -4591,6 +6072,8 @@ static void ApplyOptions(void)
   CheckMenuItem(m, IDM_OPT_ONTOP, MF_BYCOMMAND | (g_onTop ? MF_CHECKED : MF_UNCHECKED));
   CheckMenuItem(m, IDM_OPT_SHELL, MF_BYCOMMAND | (ShellMenuRegistered() ? MF_CHECKED : MF_UNCHECKED));
   CheckMenuItem(m, IDM_LOGTOGGLE, MF_BYCOMMAND | (g_logOn ? MF_CHECKED : MF_UNCHECKED));
+  CheckMenuItem(m, IDM_OPT_CLEARTMP, MF_BYCOMMAND | (g_clearTmp ? MF_CHECKED : MF_UNCHECKED));
+  CheckMenuItem(m, IDM_OPT_PAUTO, MF_BYCOMMAND | (g_protAuto ? MF_CHECKED : MF_UNCHECKED));
   SendMessageW(g_hChkNew, BM_SETCHECK, g_newWin ? BST_CHECKED : BST_UNCHECKED, 0);
   SetWindowPos(g_hMain, g_onTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
@@ -4610,6 +6093,7 @@ static void SaveSettings(void)
   WritePrivateProfileStringW(L"Options", L"NewWindow", g_newWin ? L"1" : L"0", g_iniFile);
   WritePrivateProfileStringW(L"Options", L"AlwaysOnTop", g_onTop ? L"1" : L"0", g_iniFile);
   WritePrivateProfileStringW(L"Options", L"LogEnabled", g_logOn ? L"1" : L"0", g_iniFile);
+  WritePrivateProfileStringW(L"Options", L"ClearTmp", g_clearTmp ? L"1" : L"0", g_iniFile);
 }
 
 static void Layout(int cw, int ch)
@@ -4649,6 +6133,8 @@ static void Layout(int cw, int ch)
   MoveWindow(g_hDiffLV, x, m + 82, rw, y1 - 6 - (m + 82), TRUE);
   MoveWindow(g_hWatchInfo, m, treeTop, tw, treeH, TRUE);
   MoveWindow(g_hWatchLV, x, m, rw, y1 - 6 - m, TRUE);
+  MoveWindow(g_hProtLV, m, treeTop, tw, treeH, TRUE);
+  MoveWindow(g_hProtLog, x, m, rw, y1 - 6 - m, TRUE);
 }
 
 static void ShowTreeMenu(void)
@@ -4776,7 +6262,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
       HIMAGELIST il;
       SHFILEINFOW sfi;
       wchar_t win[MAX_PATH], rg[MAX_PATH];
-      HWND *all[] = { &g_hTree, &g_hName, &g_hPath, &g_hComment, &g_hBtnJump, &g_hBtnJumpNew, &g_hChkNew, &g_hTab, &g_hSaved, &g_hCount, &g_hBtnX[0], &g_hBtnX[1], &g_hBtnX[2], &g_hSnapLV, &g_hDiffLV, &g_hSnapInfo, &g_hWatchInfo, &g_hWatchLV };
+      HWND *all[] = { &g_hTree, &g_hName, &g_hPath, &g_hComment, &g_hBtnJump, &g_hBtnJumpNew, &g_hChkNew, &g_hTab, &g_hSaved, &g_hCount, &g_hBtnX[0], &g_hBtnX[1], &g_hBtnX[2], &g_hSnapLV, &g_hDiffLV, &g_hSnapInfo, &g_hWatchInfo, &g_hWatchLV, &g_hProtLV, &g_hProtLog };
       size_t i;
       g_hMain = h;
       g_hTree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES |
@@ -4806,6 +6292,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         TabCtrl_InsertItem(g_hTab, 2, &ti);
         ti.pszText = (LPWSTR)L"Наблюдение";
         TabCtrl_InsertItem(g_hTab, 3, &ti);
+        ti.pszText = (LPWSTR)L"Защита";
+        TabCtrl_InsertItem(g_hTab, 4, &ti);
         g_hSaved = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"", WS_CHILD | WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES |
                                    TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_EDITLABELS, 0, 0, 10, 10, h, (HMENU)IDC_SAVED, g_hInst, NULL);
         g_hCount = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 0, 0, 10, 10, h, (HMENU)IDC_COUNT, g_hInst, NULL);
@@ -4822,6 +6310,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         g_hWatchLV = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_OWNERDATA, 0, 0, 10, 10, h, (HMENU)IDC_WATCHLV, g_hInst, NULL);
         ListView_SetExtendedListViewStyle(g_hWatchLV, LVS_EX_FULLROWSELECT);
         LvCol(g_hWatchLV, 0, L"Время", 125); LvCol(g_hWatchLV, 1, L"Что", 120); LvCol(g_hWatchLV, 2, L"Ветка", 250); LvCol(g_hWatchLV, 3, L"Значение", 100); LvCol(g_hWatchLV, 4, L"Было", 170); LvCol(g_hWatchLV, 5, L"Стало", 170);
+        g_hProtLV = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, 0, 0, 10, 10, h, (HMENU)IDC_PROTLV, g_hInst, NULL);
+        ListView_SetExtendedListViewStyle(g_hProtLV, LVS_EX_FULLROWSELECT);
+        LvCol(g_hProtLV, 0, L"Ветка (держим от изменений)", 185); LvCol(g_hProtLV, 1, L"Режим", 80); LvCol(g_hProtLV, 2, L"Состояние", 85);
+        g_hProtLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 10, 10, h, (HMENU)IDC_PROTLOG, g_hInst, NULL);
+        SendMessageW(g_hProtLog, EM_SETLIMITTEXT, 4000000, 0);
       }
       for (i = 0; i < sizeof all / sizeof all[0]; i++) DlgSetFont(*all[i]);
       for (i = 0; i < 3; i++) DlgSetFont(g_hLbl[i]);
@@ -4871,10 +6364,10 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
       switch (id) {
         case IDOK: if (GetFocus() == g_hTree) ActJump(FALSE); else if (GetFocus() == g_hSaved) SavedJump(FALSE); break;
         case IDC_JUMP: case IDM_JUMP:
-          if (g_tab == 0) ActJump(FALSE); else if (g_tab == 1) SavedJump(FALSE); else if (g_tab == 2) { if (id == IDC_JUMP) ActSnapNew(); } else if (id == IDC_JUMP) ActWatchStart();
+          if (g_tab == 0) ActJump(FALSE); else if (g_tab == 1) SavedJump(FALSE); else if (g_tab == 2) { if (id == IDC_JUMP) ActSnapNew(); } else if (g_tab == 3) { if (id == IDC_JUMP) ActWatchStart(); } else if (id == IDC_JUMP) ActProtAdd();
           break;
         case IDC_JUMPNEW: case IDM_JUMPNEW:
-          if (g_tab == 0) ActJump(TRUE); else if (g_tab == 1) SavedJump(TRUE); else if (g_tab == 2) { if (id == IDC_JUMPNEW) ActSnapCompare(); } else if (id == IDC_JUMPNEW) ActWatchStop();
+          if (g_tab == 0) ActJump(TRUE); else if (g_tab == 1) SavedJump(TRUE); else if (g_tab == 2) { if (id == IDC_JUMPNEW) ActSnapCompare(); } else if (g_tab == 3) { if (id == IDC_JUMPNEW) ActWatchStop(); } else if (id == IDC_JUMPNEW) ActProtDel();
           break;
         case IDC_NEWWIN:
           g_newWin = SendMessageW(g_hChkNew, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -4926,13 +6419,22 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         case IDM_WCLEAR: WatchClearEvents(); WatchViewRefresh(); break;
         case IDM_WLOG: ActWatchOpenLog(); break;
         case IDM_WDIR: EnsureDir(g_watchDir); ShellExecuteW(h, L"open", g_watchDir, NULL, NULL, SW_SHOWNORMAL); break;
+        case IDM_PADD: ActProtAdd(); break;
+        case IDM_PDEL: ActProtDel(); break;
+        case IDM_PSTART: ActProtToggle(); break;
+        case IDM_PLOG: ActProtOpenLog(); break;
+        case IDM_EDIT_DEF: ActEditInEditor(0); break;
+        case IDM_EDIT_NP: ActEditInEditor(2); break;
+        case IDM_EDIT_OTHER: ActEditInEditor(1); break;
+        case IDM_OPT_CLEARTMP: g_clearTmp = !g_clearTmp; ApplyOptions(); break;
+        case IDM_OPT_PAUTO: ActProtAutoToggle(); ApplyOptions(); break;
         case IDM_LOGTOGGLE: g_logOn = !g_logOn; ApplyOptions(); break;
         case IDM_SHOWFILE: SavedShow(); break;
         case IDM_RESTORE: SavedRestore(); break;
-        case IDC_X1: PostMessageW(h, WM_COMMAND, g_tab == 0 ? IDM_SAVE : g_tab == 1 ? IDM_NOTEPAD : g_tab == 2 ? IDM_REPOPEN : IDM_WCLEAR, 0); break;
-        case IDC_X2: PostMessageW(h, WM_COMMAND, g_tab == 0 ? IDM_EXPBAT : g_tab == 1 ? IDM_SHOWFILE : g_tab == 2 ? IDM_SNAPDIR : IDM_WLOG, 0); break;
+        case IDC_X1: PostMessageW(h, WM_COMMAND, g_tab == 0 ? IDM_SAVE : g_tab == 1 ? IDM_NOTEPAD : g_tab == 2 ? IDM_REPOPEN : g_tab == 3 ? IDM_WCLEAR : IDM_PSTART, 0); break;
+        case IDC_X2: PostMessageW(h, WM_COMMAND, g_tab == 0 ? IDM_EXPBAT : g_tab == 1 ? IDM_SHOWFILE : g_tab == 2 ? IDM_SNAPDIR : g_tab == 3 ? IDM_WLOG : IDM_PLOG, 0); break;
         case IDC_X3:
-          if (g_tab == 0) OpenRegedit(g_newWin); else if (g_tab == 1) SavedRestore(); else if (g_tab == 2) ActSnapDelete(); else PostMessageW(h, WM_COMMAND, IDM_WDIR, 0);
+          if (g_tab == 0) OpenRegedit(g_newWin); else if (g_tab == 1) SavedRestore(); else if (g_tab == 2) ActSnapDelete(); else if (g_tab == 3) PostMessageW(h, WM_COMMAND, IDM_WDIR, 0); else ActProtAutoToggle();
           break;
         case IDM_IMPORT: ActImport(); break;
         case IDM_EXPORT: ActExport(); break;
@@ -5111,6 +6613,16 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
       return 0;
     case WM_COPYDATA: {
       COPYDATASTRUCT *cd = (COPYDATASTRUCT *)lp;
+      if (cd->dwData == 2 && cd->lpData && cd->cbData >= 2) {
+        wchar_t *s2 = (wchar_t *)malloc(cd->cbData + 4), *nm2, *fo2;
+        memcpy(s2, cd->lpData, cd->cbData);
+        s2[cd->cbData / 2] = 0; s2[cd->cbData / 2 + 1] = 0;
+        nm2 = wcschr(s2, 1);
+        if (nm2) { *nm2++ = 0; fo2 = wcschr(nm2, 1); if (fo2) *fo2++ = 0; } else fo2 = NULL;
+        GuiAddBookmark(s2, nm2, fo2);
+        free(s2);
+        return TRUE;
+      }
       if (cd->dwData == 1 && cd->lpData && cd->cbData >= 2) {
         wchar_t *s = (wchar_t *)malloc(cd->cbData + 4);
         memcpy(s, cd->lpData, cd->cbData);
@@ -5135,6 +6647,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
       return 0;
     }
     case WM_APP_WATCH: WatchViewRefresh(); return 0;
+    case WM_APP_PROT: {
+      wchar_t *t = (wchar_t *)lp;
+      if (t) { ProtGuiAppend(t); free(t); }
+      if (g_tab == 4) ProtRefreshUI();
+      return 0;
+    }
     case WM_APP_CHECK: {
       HTREEITEM it = (HTREEITEM)wp;
       NodeData *nd = GetNode(it);
@@ -5156,10 +6674,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
       else MessageBoxW(h, L"Не удалось запустить regedit.exe (возможно, вы отменили запрос UAC).", APP_NAME, MB_ICONWARNING);
       return 0;
     case WM_ENDSESSION:
-      if (wp) { WatchStop(); SaveSettings(); SaveAll(); }
+      if (wp) { WatchStopAll(); if (g_clearTmp) ClearTmpDir(); SaveSettings(); SaveAll(); }
       return 0;
     case WM_CLOSE:
-      WatchStop();
+      WatchStopAll();
+      if (g_clearTmp) ClearTmpDir();
       SaveSettings();
       SaveAll();
       DestroyWindow(h);
@@ -5216,7 +6735,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
   (void)hPrev; (void)cmd;
   g_hInst = hInst;
   InitPaths();
+  argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (argv) ParseCli(argc, argv);
   _snwprintf(g_cfgFile, MAX_PATH - 1, L"%ls\\keyshelf.cfg", g_dataDir);
+  if (g_cli.cfg[0]) GetFullPathNameW(g_cli.cfg, MAX_PATH, g_cfgFile, NULL);
   LoadConfig();
   _snwprintf(g_savedDir, MAX_PATH - 1, L"%ls\\Saved", g_dataDir);
   {
@@ -5233,11 +6755,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
   _snwprintf(g_repDir, MAX_PATH - 1, L"%ls\\Reports", g_dataDir);
   _snwprintf(g_exclFile, MAX_PATH - 1, L"%ls\\snapshot_exclude.txt", g_dataDir);
 
-  argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-  if (argv && argc >= 5 && !_wcsicmp(argv[1], L"/snap")) return CliSnap(argc, argv);
-  if (argv && argc >= 5 && !_wcsicmp(argv[1], L"/cmp")) return CliCmp(argc, argv);
-  if (argv && argc >= 4 && !_wcsicmp(argv[1], L"/watch")) return CliWatch(argc, argv);
-  if (argv && argc >= 2 && !_wcsicmp(argv[1], L"/probe")) return CliProbe();
+  _snwprintf(g_tmpDir, MAX_PATH - 1, L"%ls\\tmp", g_savedDir);
+  _snwprintf(g_protLog, MAX_PATH + 15, L"%ls\\protect.log", g_watchDir);
+  g_logOn = GetPrivateProfileIntW(L"Options", L"LogEnabled", 1, g_iniFile) != 0;
+  g_clearTmp = GetPrivateProfileIntW(L"Options", L"ClearTmp", 1, g_iniFile) != 0;
+  ProtLoad();
+  if (argc > 1) ConInit();
+  if (g_cli.bad || (g_cli.cmd != C_NONE && !(g_cli.cmd == C_ADDREG && !g_cli.noGui)) || (g_cli.noGui && g_cli.cmd == C_NONE)) return RunCli();
+#ifdef KS_CONSOLE
+  { DWORD pl[2]; if (GetConsoleProcessList(pl, 2) <= 1) FreeConsole(); }
+#endif
   mtx = CreateMutexW(NULL, FALSE, MUTEX_NAME);
   already = (GetLastError() == ERROR_ALREADY_EXISTS);
   if (already) {
@@ -5321,6 +6848,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
   AppendMenuW(ms, MF_SEPARATOR, 0, NULL);
   AppendMenuW(ms, MF_STRING, IDM_OPT_SHELL, L"Пункт «Добавить в Key Shelf Reg Jumper» в меню .reg-файлов");
   AppendMenuW(ms, MF_STRING, IDM_LOGTOGGLE, L"Вести лог (keyshelf.log)");
+  AppendMenuW(ms, MF_STRING, IDM_OPT_CLEARTMP, L"Очищать временную папку Saved\\tmp при выходе");
   AppendMenuW(mh, MF_STRING, IDM_ABOUT, L"&О программе");
   AppendMenuW(mb, MF_POPUP, (UINT_PTR)mf, L"&Файл");
   {
@@ -5334,7 +6862,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
     AppendMenuW(mv, MF_STRING, IDM_OPENREG_W, L"Открыть regedit в новом окне (/m)");
     AppendMenuW(mv, MF_SEPARATOR, 0, NULL);
     AppendMenuW(mv, MF_STRING, IDM_SAVE, L"Сохранить ветку(и) в .reg...\tCtrl+S");
-    AppendMenuW(mv, MF_STRING, IDM_EXPBAT, L"Экспорт ветки(ей) в .bat...");
+    AppendMenuW(mv, MF_STRING, IDM_EXPBAT, L"Экспорт ветки(ей) в .bat / .vbs...");
+    AppendMenuW(mv, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(mv, MF_STRING, IDM_EDIT_DEF, L"Править в текстовом редакторе по умолчанию...");
+    AppendMenuW(mv, MF_STRING, IDM_EDIT_NP, L"Править в Блокноте (notepad.exe)...");
+    AppendMenuW(mv, MF_STRING, IDM_EDIT_OTHER, L"Править в другом редакторе...");
     AppendMenuW(mb, MF_POPUP, (UINT_PTR)mv, L"&Ветка");
     AppendMenuW(mc, MF_STRING, IDM_CHECKALL, L"Отметить все ветки");
     AppendMenuW(mc, MF_STRING, IDM_UNCHECKALL, L"Снять все отметки");
@@ -5363,6 +6895,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
     AppendMenuW(mw, MF_STRING, IDM_WLOG, L"Открыть лог наблюдения");
     AppendMenuW(mw, MF_STRING, IDM_WDIR, L"Открыть папку логов наблюдения");
     AppendMenuW(mb, MF_POPUP, (UINT_PTR)mw, L"&Наблюдение");
+  }
+  {
+    HMENU mp = CreatePopupMenu();
+    AppendMenuW(mp, MF_STRING, IDM_PADD, L"Добавить ветки в список защиты...");
+    AppendMenuW(mp, MF_STRING, IDM_PDEL, L"Убрать выбранные из списка");
+    AppendMenuW(mp, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(mp, MF_STRING, IDM_PSTART, L"Запустить / остановить защиту");
+    AppendMenuW(mp, MF_STRING, IDM_PLOG, L"Открыть лог защиты");
+    AppendMenuW(mp, MF_STRING, IDM_OPT_PAUTO, L"Запускать защиту при старте программы");
+    AppendMenuW(mb, MF_POPUP, (UINT_PTR)mp, L"&Защита");
   }
   AppendMenuW(mb, MF_POPUP, (UINT_PTR)ms, L"&Настройки");
   AppendMenuW(mb, MF_POPUP, (UINT_PTR)mh, L"&Справка");
@@ -5396,6 +6938,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
   ApplyOptions();
   ShowWindow(g_hMain, show);
   UpdateWindow(g_hMain);
+  ProtRefreshUI();
+  if (g_protAuto && g_npitems > 0) {
+    if (!ProtBegin(g_pitems, g_npitems, TRUE, FALSE)) Log(L"Защита: автозапуск не удался");
+    ProtRefreshUI();
+  }
   {
     HTREEITEM first = TreeView_GetRoot(g_hTree);
     if (first) TreeView_SelectItem(g_hTree, first);
@@ -5429,3 +6976,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
   CloseHandle(mtx);
   return (int)msg.wParam;
 }
+
+#ifdef KS_CONSOLE
+int wmain(void) { return wWinMain(GetModuleHandleW(NULL), NULL, GetCommandLineW(), SW_SHOWDEFAULT); }
+#endif

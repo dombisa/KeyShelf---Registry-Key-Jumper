@@ -1,12 +1,16 @@
 #!/bin/sh
 # Кросс-компиляция под Windows из Linux (Debian/Ubuntu):
 #   sudo apt install gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 binutils-mingw-w64
+# Собираются: оконная версия (x64, x86) и консольная версия для скриптов (cli_x64, cli_x86).
 set -e
 cd "$(dirname "$0")/src"
 LIBS="-lcomctl32 -lcomdlg32 -lshell32 -lshlwapi -ladvapi32 -luser32 -lgdi32 -lole32"
+FLAGS="-O2 -Wall -Wextra -municode -static -s"
 x86_64-w64-mingw32-windres -O coff res.rc -o res64.o
 i686-w64-mingw32-windres   -O coff res.rc -o res32.o
-x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -municode -mwindows -static -s -o ../KeyShelfRegJumper_x64.exe keyshelf.c res64.o $LIBS
-i686-w64-mingw32-gcc   -O2 -Wall -Wextra -municode -mwindows -static -s -o ../KeyShelfRegJumper_x86.exe keyshelf.c res32.o $LIBS
+x86_64-w64-mingw32-gcc $FLAGS -mwindows -o ../KeyShelfRegJumper_x64.exe keyshelf.c res64.o $LIBS
+i686-w64-mingw32-gcc   $FLAGS -mwindows -o ../KeyShelfRegJumper_x86.exe keyshelf.c res32.o $LIBS
+x86_64-w64-mingw32-gcc $FLAGS -mconsole -DKS_CONSOLE -o ../KeyShelfRegJumper_cli_x64.exe keyshelf.c res64.o $LIBS
+i686-w64-mingw32-gcc   $FLAGS -mconsole -DKS_CONSOLE -o ../KeyShelfRegJumper_cli_x86.exe keyshelf.c res32.o $LIBS
 rm -f res64.o res32.o
-echo "OK: KeyShelfRegJumper_x64.exe, KeyShelfRegJumper_x86.exe"
+echo "OK: KeyShelfRegJumper_x64.exe, _x86.exe (окно); KeyShelfRegJumper_cli_x64.exe, _cli_x86.exe (консоль)"
