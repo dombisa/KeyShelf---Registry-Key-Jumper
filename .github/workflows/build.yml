@@ -22,7 +22,16 @@ jobs:
           sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 binutils-mingw-w64
 
       - name: Build
-        run: ./build.sh
+        run: |
+          set +e
+          ./build.sh > build.log 2>&1
+          rc=$?
+          cat build.log
+          if [ $rc -ne 0 ]; then
+            grep -E "error|Error|undefined|fatal" build.log | head -15 | while IFS= read -r l; do echo "::error::${l:0:300}"; done
+            tail -4 build.log | while IFS= read -r l; do echo "::error::${l:0:300}"; done
+          fi
+          exit $rc
 
       - uses: actions/upload-artifact@v4
         with:
