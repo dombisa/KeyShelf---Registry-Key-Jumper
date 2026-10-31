@@ -5395,14 +5395,27 @@ static int BmFindChildFolder(BModel *m, int parent, const wchar_t *name)
   return -1;
 }
 
+/* разбор «A/B\\C» на части (вместо wcstok: у него разная сигнатура в разных версиях mingw) */
+static wchar_t *TokNext(wchar_t **state)
+{
+  wchar_t *q = *state, *start;
+  if (!q) return NULL;
+  while (*q == L'/' || *q == L'\\') q++;
+  if (!*q) { *state = NULL; return NULL; }
+  start = q;
+  while (*q && *q != L'/' && *q != L'\\') q++;
+  if (*q) { *q = 0; *state = q + 1; } else *state = NULL;
+  return start;
+}
+
 /* найти или создать цепочку папок «A/B/C»; возвращает индекс последней папки (-1 - корень) */
 static int BmEnsureFolders(BModel *m, const wchar_t *folderPath)
 {
-  wchar_t buf[600], *tok;
+  wchar_t buf[600], *tok, *st;
   int parent = -1;
   if (!folderPath || !folderPath[0]) return -1;
   wcsncpy(buf, folderPath, 599); buf[599] = 0;
-  for (tok = wcstok(buf, L"/\\"); tok; tok = wcstok(NULL, L"/\\")) {
+  for (st = buf, tok = TokNext(&st); tok; tok = TokNext(&st)) {
     int idx;
     if (!tok[0]) continue;
     idx = BmFindChildFolder(m, parent, tok);
@@ -5452,12 +5465,12 @@ static HTREEITEM FindChildFolderGui(HTREEITEM parent, const wchar_t *name)
 static void GuiAddBookmark(const wchar_t *key, const wchar_t *name, const wchar_t *folder)
 {
   HTREEITEM parent = TVI_ROOT, it;
-  wchar_t buf[600], *tok, nm[300], cm[200], ts[32];
+  wchar_t buf[600], *tok, *st, nm[300], cm[200], ts[32];
   const wchar_t *sl = wcsrchr(key, L'\\');
   CommitEdits();
   if (folder && folder[0]) {
     wcsncpy(buf, folder, 599); buf[599] = 0;
-    for (tok = wcstok(buf, L"/\\"); tok; tok = wcstok(NULL, L"/\\")) {
+    for (st = buf, tok = TokNext(&st); tok; tok = TokNext(&st)) {
       HTREEITEM f = FindChildFolderGui(parent, tok);
       if (!f) f = InsertNode(parent, TVI_LAST, tok, TRUE, L"", L"");
       parent = f;
